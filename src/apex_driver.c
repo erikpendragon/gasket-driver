@@ -1289,7 +1289,7 @@ static void apex_pci_remove(struct pci_dev *pci_dev)
 	 * mappings. The BARs stay mapped until gasket_pci_remove_device(), so
 	 * a poll that is still running can finish safely.
 	 */
-	if (apex_dev->hwmon)
+	if (IS_REACHABLE(CONFIG_HWMON) && apex_dev->hwmon)
 		hwmon_device_unregister(apex_dev->hwmon);
 	gasket_disable_device(gasket_dev);
 	cancel_delayed_work_sync(&apex_dev->check_temperature_work);
