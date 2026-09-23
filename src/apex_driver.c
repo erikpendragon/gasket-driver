@@ -881,9 +881,16 @@ static ssize_t sysfs_store(struct device *device, struct device_attribute *attr,
 	case ATTR_TEMP_POLL_INTERVAL:
 		cancel_delayed_work_sync(&apex_dev->check_temperature_work);
 		atomic_set(&apex_dev->temp_poll_interval, value);
-		if (value > 0)
+		if (value > 0) {
 			schedule_delayed_work(&apex_dev->check_temperature_work,
 					      msecs_to_jiffies(value));
+		} else {
+			/* No poller: drop its throttle so it cannot stick. */
+			mutex_lock(&gasket_dev->mutex);
+			apex_dev->thermal_clk_div = 0;
+			apex_apply_clk_div(apex_dev);
+			mutex_unlock(&gasket_dev->mutex);
+		}
 
 		break;
 	default:
@@ -1070,10 +1077,18 @@ static int apex_device_open_cb(struct gasket_dev *gasket_dev)
 {
 	struct apex_dev *apex_dev = pci_get_drvdata(gasket_dev->pci_dev);
 
-	/* A new owner starts at full speed until it asks otherwise. */
-	if (apex_dev)
+	int ret;
+
+	ret = gasket_reset_nolock(gasket_dev);
+	if (ret)
+		return ret;
+
+	/* A new owner starts at full speed (or the thermal limit). */
+	if (apex_dev) {
 		apex_dev->perf_clk_div = 0;
-	return gasket_reset_nolock(gasket_dev);
+		apex_apply_clk_div(apex_dev);
+	}
+	return 0;
 }
 
 static const struct pci_device_id apex_pci_ids[] = {
@@ -1350,14 +1365,17 @@ static void apex_pci_shutdown(struct pci_dev *pci_dev)
 
 	cancel_delayed_work_sync(&apex_dev->check_temperature_work);
 	mutex_lock(&gasket_dev->mutex);
-	apex_enter_reset(gasket_dev);
+	/* Usually already in reset (closed, power save): then skip the wait. */
+	if (!is_gcb_in_reset(gasket_dev))
+		apex_enter_reset(gasket_dev);
 	mutex_unlock(&gasket_dev->mutex);
 	pci_clear_master(pci_dev);
 }
 
 /*
  * PCIe error (AER/DPC). The driver cannot rebuild userspace's state on the
- * chip after a reset, so it stops touching the device and reports it lost.
+ * chip after a reset, so it reports the device lost. Only the temperature
+ * poller is stopped here; file operations fail once the core removes it.
  */
 static pci_ers_result_t apex_pci_error_detected(struct pci_dev *pci_dev,
 						pci_channel_state_t state)

@@ -1180,8 +1180,15 @@ int gasket_page_table_map(struct gasket_page_table *pg_tbl, ulong host_addr,
 
 	mutex_lock(&pg_tbl->mutex);
 
-	/* The coherent buffer may have come or gone while unlocked. */
-	if (is_coherent(pg_tbl, host_addr, num_pages) != coherent) {
+	/*
+	 * The ioctl checked the device range without this mutex; a partition
+	 * change since then could make it run past the tables. Check again.
+	 */
+	if (gasket_page_table_is_dev_addr_bad(pg_tbl, dev_addr,
+					      (ulong)num_pages * PAGE_SIZE)) {
+		ret = -EINVAL;
+	} else if (is_coherent(pg_tbl, host_addr, num_pages) != coherent) {
+		/* The coherent buffer came or went while unlocked. */
 		ret = -EAGAIN;
 	} else if (gasket_addr_is_simple(pg_tbl, dev_addr)) {
 		ret = gasket_map_simple_pages(pg_tbl, NULL, host_addr, pages,
@@ -1225,7 +1232,10 @@ void gasket_page_table_unmap(struct gasket_page_table *pg_tbl, u64 dev_addr,
 		return;
 
 	mutex_lock(&pg_tbl->mutex);
-	gasket_page_table_unmap_nolock(pg_tbl, dev_addr, num_pages);
+	/* Re-check under the mutex: a partition change may have intervened. */
+	if (!gasket_page_table_is_dev_addr_bad(pg_tbl, dev_addr,
+					       (ulong)num_pages * PAGE_SIZE))
+		gasket_page_table_unmap_nolock(pg_tbl, dev_addr, num_pages);
 	mutex_unlock(&pg_tbl->mutex);
 }
 EXPORT_SYMBOL(gasket_page_table_unmap);
@@ -1281,7 +1291,10 @@ int gasket_page_table_map_dmabuf(struct gasket_page_table *pg_tbl, int fd,
 	locked = 1;
 
 	__sg_page_iter_start(&sg_iter.base, sgt->sgl, sgt->nents, 0);
-	if (gasket_addr_is_simple(pg_tbl, dev_addr)) {
+	if (gasket_page_table_is_dev_addr_bad(pg_tbl, dev_addr,
+					      (ulong)num_pages * PAGE_SIZE)) {
+		ret = -EINVAL;
+	} else if (gasket_addr_is_simple(pg_tbl, dev_addr)) {
 		ret = gasket_map_simple_pages(pg_tbl, &sg_iter, 0, NULL,
 					      dev_addr, num_pages, flags);
 	} else {
@@ -1364,7 +1377,9 @@ int gasket_page_table_unmap_dmabuf(struct gasket_page_table *pg_tbl, int fd,
 
 	mutex_lock(&pg_tbl->mutex);
 
-	gasket_page_table_unmap_nolock(pg_tbl, dev_addr, num_pages);
+	if (!gasket_page_table_is_dev_addr_bad(pg_tbl, dev_addr,
+					       (ulong)num_pages * PAGE_SIZE))
+		gasket_page_table_unmap_nolock(pg_tbl, dev_addr, num_pages);
 	gasket_page_table_detach_dmabuf_nolock(pg_tbl, dmabuf, dev_addr,
 					       num_pages);
 
@@ -1659,20 +1674,21 @@ int gasket_free_coherent_memory(struct gasket_dev *gasket_dev, u64 size,
 	if (driver_desc->coherent_buffer_description.base != dma_address)
 		return -EADDRNOTAVAIL;
 
-	/* Freeing memory a process still has mapped would hand it to others. */
-	if (gasket_dev->coherent_mmap_count)
-		return -EBUSY;
-
 	gasket_free_coherent_memory_all(gasket_dev, index);
 
 	return 0;
 }
 
-/* Free the device's coherent DMA buffer, if any. Idempotent. */
+/*
+ * Free the device's coherent DMA buffer, if any. Idempotent. Takes it away
+ * from user mappings first. Called with the device mutex held.
+ */
 void gasket_free_coherent_buffer(struct gasket_dev *gasket_dev)
 {
 	if (!gasket_dev->coherent_buffer.length_bytes)
 		return;
+
+	gasket_zap_coherent_mappings(gasket_dev);
 
 	dma_free_coherent(gasket_get_device(gasket_dev),
 			  gasket_dev->coherent_buffer.length_bytes,

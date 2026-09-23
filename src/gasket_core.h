@@ -355,13 +355,6 @@ struct gasket_dev {
 
 	/* Open files, for unmapping user mappings on removal. Under mutex. */
 	struct list_head open_files;
-
-	/*
-	 * User mappings of the coherent buffer, and whether the owner's last
-	 * close asked to free it while such mappings remained. Under mutex.
-	 */
-	int coherent_mmap_count;
-	bool coherent_free_pending;
 };
 
 /*
@@ -382,6 +375,9 @@ static inline void gasket_dev_exit(struct gasket_dev *gasket_dev)
 {
 	up_read(&gasket_dev->state_sem);
 }
+
+/* Remove the coherent buffer from all user mappings. Device mutex held. */
+void gasket_zap_coherent_mappings(struct gasket_dev *gasket_dev);
 
 /* Type of the ioctl handler callback. */
 typedef long (*gasket_ioctl_handler_cb_t)(struct file *file, uint cmd,

@@ -18,6 +18,7 @@
 
 #include <linux/capability.h>
 #include <linux/compat.h>
+#include <linux/vmalloc.h>
 #include <linux/compiler.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -368,8 +369,12 @@ static int gasket_map_pci_bar(struct gasket_dev *gasket_dev, int bar_num)
 	 * Request and map the BAR as a managed resource: it stays mapped
 	 * until the driver is unbound, after remove() has stopped every user.
 	 */
+	/*
+	 * The region name is kept by pointer until devres releases it, which
+	 * can be after gasket_dev is freed: use the driver's static name.
+	 */
 	virt_base = pcim_iomap_region(gasket_dev->pci_dev, bar_num,
-				      gasket_dev->dev_info.name);
+				      driver_desc->name);
 	if (IS_ERR(virt_base)) {
 		dev_err(gasket_dev->dev,
 			"Cannot map BAR %d memory region %pR [ret=%ld]\n",
@@ -710,6 +715,9 @@ void gasket_disable_device(struct gasket_dev *gasket_dev)
 		    pci_device_is_present(gasket_dev->pci_dev)) {
 			mutex_lock(&gasket_dev->mutex);
 			driver_desc->device_reset_cb(gasket_dev);
+			/* Leave it in its low-power state, as after close. */
+			gasket_check_and_invoke_callback_nolock(gasket_dev,
+				driver_desc->device_close_cb);
 			mutex_unlock(&gasket_dev->mutex);
 		}
 		pci_clear_master(gasket_dev->pci_dev);
@@ -720,14 +728,12 @@ void gasket_disable_device(struct gasket_dev *gasket_dev)
 	gasket_interrupt_cleanup(gasket_dev);
 
 	/*
-	 * A VMA that still maps the coherent buffer (possibly one mmap() was
-	 * linking during the unmap walk above) keeps it until it is closed.
+	 * Free the coherent buffer while the device is still there. Every
+	 * mapping was zapped above, and the fault handler inserts no page
+	 * once "gone" is set, so no user PTE can point at it.
 	 */
 	mutex_lock(&gasket_dev->mutex);
-	if (gasket_dev->coherent_mmap_count)
-		gasket_dev->coherent_free_pending = true;
-	else
-		gasket_free_coherent_buffer(gasket_dev);
+	gasket_free_coherent_buffer(gasket_dev);
 	mutex_unlock(&gasket_dev->mutex);
 
 	for (i = 0; i < driver_desc->num_page_tables; ++i) {
@@ -1083,54 +1089,85 @@ fail:
 	return DO_MAP_REGION_FAILURE;
 }
 
-/*
- * Count user mappings of the coherent buffer. A VMA that is split or copied
- * on fork gets open(); every VMA gets close(). The buffer is only freed once
- * no mapping is left.
- */
-static void gasket_coherent_vma_open(struct vm_area_struct *vma)
+/* File offset (pgoff space) and size of the coherent buffer window. */
+static void gasket_coherent_window(const struct gasket_dev *gasket_dev,
+				   loff_t *start, loff_t *len)
 {
-	struct gasket_dev *gasket_dev = vma->vm_private_data;
+	const struct gasket_driver_desc *driver_desc =
+		gasket_dev->internal_desc->driver_desc;
 
-	mutex_lock(&gasket_dev->mutex);
-	gasket_dev->coherent_mmap_count++;
-	mutex_unlock(&gasket_dev->mutex);
+	*start = driver_desc->coherent_buffer_description.base -
+		 driver_desc->legacy_mmap_address_offset;
+	*len = driver_desc->coherent_buffer_description.size;
 }
 
-static void gasket_coherent_vma_close(struct vm_area_struct *vma)
+/*
+ * Take the coherent buffer away from every user mapping of every open file.
+ * Called with the device mutex held, before the buffer is freed; a later
+ * access faults, and the fault handler finds no buffer (SIGBUS).
+ */
+void gasket_zap_coherent_mappings(struct gasket_dev *gasket_dev)
 {
+	struct gasket_open_file *of;
+	loff_t start, len;
+
+	lockdep_assert_held(&gasket_dev->mutex);
+	gasket_coherent_window(gasket_dev, &start, &len);
+	list_for_each_entry(of, &gasket_dev->open_files, node)
+		unmap_mapping_range(of->filp->f_mapping, start, len, 1);
+}
+EXPORT_SYMBOL(gasket_zap_coherent_mappings);
+
+/*
+ * Page fault on a coherent buffer mapping. Pages are inserted one at a time
+ * under the device mutex, and only while the buffer exists and the device is
+ * present, so freeing the buffer (after gasket_zap_coherent_mappings()) never
+ * leaves a user PTE pointing at freed memory.
+ */
+static vm_fault_t gasket_coherent_vma_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
 	struct gasket_dev *gasket_dev = vma->vm_private_data;
-	int i;
+	vm_fault_t ret = VM_FAULT_SIGBUS;
+	loff_t start, len, off;
+	void *virt;
+
+	gasket_coherent_window(gasket_dev, &start, &len);
+	off = ((loff_t)vmf->pgoff << PAGE_SHIFT) - start;
 
 	mutex_lock(&gasket_dev->mutex);
-	if (--gasket_dev->coherent_mmap_count == 0 &&
-	    gasket_dev->coherent_free_pending) {
-		gasket_dev->coherent_free_pending = false;
-		for (i = 0; i < gasket_dev->num_page_tables; ++i)
-			gasket_free_coherent_memory_all(gasket_dev, i);
-		/* After removal the page tables are gone; free the buffer. */
-		gasket_free_coherent_buffer(gasket_dev);
-	}
+	if (READ_ONCE(gasket_dev->gone) ||
+	    off < 0 || off >= gasket_dev->coherent_buffer.length_bytes)
+		goto out;
+
+	virt = gasket_dev->coherent_buffer.virt_base + off;
+	ret = vmf_insert_pfn(vma, vmf->address,
+			     is_vmalloc_addr(virt) ? vmalloc_to_pfn(virt) :
+						     page_to_pfn(virt_to_page(virt)));
+out:
 	mutex_unlock(&gasket_dev->mutex);
+	return ret;
 }
 
 static const struct vm_operations_struct gasket_coherent_vm_ops = {
-	.open = gasket_coherent_vma_open,
-	.close = gasket_coherent_vma_close,
+	.fault = gasket_coherent_vma_fault,
 };
 
-/* Map a region of coherent memory. */
+/* Map a region of coherent memory. Called with the device mutex held. */
 static int gasket_mmap_coherent(struct gasket_dev *gasket_dev,
 				struct vm_area_struct *vma)
 {
 	const struct gasket_driver_desc *driver_desc =
 		gasket_dev->internal_desc->driver_desc;
 	const ulong requested_length = vma->vm_end - vma->vm_start;
-	int ret;
 	ulong permissions;
+	loff_t start, len, off;
 
-	if (requested_length == 0 || requested_length >
-	    gasket_dev->coherent_buffer.length_bytes) {
+	gasket_coherent_window(gasket_dev, &start, &len);
+	off = ((loff_t)vma->vm_pgoff << PAGE_SHIFT) - start;
+
+	if (requested_length == 0 || off < 0 ||
+	    off + requested_length > gasket_dev->coherent_buffer.length_bytes) {
 		trace_gasket_mmap_exit(-EINVAL);
 		return -EINVAL;
 	}
@@ -1142,28 +1179,19 @@ static int gasket_mmap_coherent(struct gasket_dev *gasket_dev,
 		return -EPERM;
 	}
 
-	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-	vma->vm_pgoff = 0;
-	ret = dma_mmap_coherent(gasket_dev->dma_dev, vma,
-				gasket_dev->coherent_buffer.virt_base,
-				gasket_dev->coherent_buffer.phys_base,
-				requested_length);
-	if (ret) {
-		dev_err(gasket_dev->dev,
-			"Error mmapping coherent buffer err=%d.\n", ret);
-		trace_gasket_mmap_exit(ret);
-		return ret;
-	}
-
-	/* Record the user virtual to dma_address mapping that was
-	 * created by the kernel.
+	/*
+	 * Pages are inserted on first touch (gasket_coherent_vma_fault()).
+	 * vm_pgoff keeps the real file offset, so the buffer's mappings can be
+	 * found and removed by offset range.
 	 */
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_ops = &gasket_coherent_vm_ops;
+
+	/* Record the user virtual to dma_address mapping. */
 	gasket_set_user_virt(gasket_dev, requested_length,
 			     gasket_dev->coherent_buffer.phys_base,
 			     vma->vm_start);
-
-	vma->vm_ops = &gasket_coherent_vm_ops;
-	gasket_dev->coherent_mmap_count++;
 	return 0;
 }
 
@@ -1235,6 +1263,18 @@ static int __gasket_mmap(struct file *filp, struct vm_area_struct *vma)
 	enum do_map_region_status map_status;
 
 	driver_desc = gasket_dev->internal_desc->driver_desc;
+
+	/*
+	 * Device memory is never copy-on-write: a private writable mapping of
+	 * a PFN range would trip a BUG in vmf_insert_pfn(). (A read-only
+	 * file's MAP_SHARED mapping has neither VM_SHARED nor VM_MAYWRITE and
+	 * is fine.)
+	 */
+	/* Same test as is_cow_mapping() (renamed vma_is_cow_mapping() in 7.3). */
+	if ((vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE) {
+		trace_gasket_mmap_exit(-EINVAL);
+		return -EINVAL;
+	}
 
 	if (vma->vm_start & ~PAGE_MASK) {
 		dev_err(gasket_dev->dev,
@@ -1573,15 +1613,11 @@ static int gasket_release(struct inode *inode, struct file *file)
 			}
 
 			/*
-			 * Another (read-only) opener may still map the coherent
-			 * buffer; then free it when its last mapping goes.
+			 * Freeing takes the buffer away from every mapping
+			 * first, including a read-only opener's.
 			 */
-			if (gasket_dev->coherent_mmap_count) {
-				gasket_dev->coherent_free_pending = true;
-			} else {
-				for (i = 0; i < driver_desc->num_page_tables; ++i)
-					gasket_free_coherent_memory_all(gasket_dev, i);
-			}
+			for (i = 0; i < driver_desc->num_page_tables; ++i)
+				gasket_free_coherent_memory_all(gasket_dev, i);
 
 			/* Closes device, enters power save. */
 			gasket_check_and_invoke_callback_nolock(gasket_dev,
