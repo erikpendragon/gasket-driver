@@ -1665,7 +1665,7 @@ void gasket_set_dma_device(struct gasket_dev *gasket_dev,
 }
 EXPORT_SYMBOL(gasket_set_dma_device);
 
-/**
+/*
  * Lookup a name by number in a num_name table.
  * @num: Number to lookup.
  * @table: Array of num_name structures, the table for the lookup.
@@ -1764,7 +1764,7 @@ struct device *gasket_get_device(struct gasket_dev *dev)
 	return dev->dev;
 }
 
-/**
+/*
  * Asynchronously waits on device.
  * @gasket_dev: Device struct.
  * @bar: Bar

@@ -340,7 +340,7 @@ static int apex_enter_reset(struct gasket_dev *gasket_dev)
 	/*    - Wait for DMA pause complete. */
 	if (gasket_wait_with_reschedule(gasket_dev, APEX_BAR_INDEX,
 					APEX_BAR2_REG_USER_HIB_DMA_PAUSED, 1, 1,
-					APEX_RESET_DELAY, APEX_RESET_RETRY)) {
+					APEX_RESET_RETRY, APEX_RESET_DELAY)) {
 		dev_err(gasket_dev->dev,
 			"DMAs did not quiesce within timeout (%d ms)\n",
 			APEX_RESET_RETRY * APEX_RESET_DELAY);
@@ -362,7 +362,7 @@ static int apex_enter_reset(struct gasket_dev *gasket_dev)
 	/*    - Wait for RAM shutdown. */
 	if (gasket_wait_with_reschedule(gasket_dev, APEX_BAR_INDEX,
 					APEX_BAR2_REG_SCU_3, 1 << 6, 1 << 6,
-					APEX_RESET_DELAY, APEX_RESET_RETRY)) {
+					APEX_RESET_RETRY, APEX_RESET_DELAY)) {
 		dev_err(gasket_dev->dev,
 			"RAM did not shut down within timeout (%d ms)\n",
 			APEX_RESET_RETRY * APEX_RESET_DELAY);
@@ -408,7 +408,7 @@ static int apex_quit_reset(struct gasket_dev *gasket_dev)
 	/*    - Wait for RAM enable. */
 	if (gasket_wait_with_reschedule(gasket_dev, APEX_BAR_INDEX,
 					APEX_BAR2_REG_SCU_3, 1 << 6, 0,
-					APEX_RESET_DELAY, APEX_RESET_RETRY)) {
+					APEX_RESET_RETRY, APEX_RESET_DELAY)) {
 		dev_err(gasket_dev->dev,
 			"RAM did not enable within timeout (%d ms)\n",
 			APEX_RESET_RETRY * APEX_RESET_DELAY);
@@ -419,7 +419,7 @@ static int apex_quit_reset(struct gasket_dev *gasket_dev)
 	if (gasket_wait_with_reschedule(gasket_dev, APEX_BAR_INDEX,
 					APEX_BAR2_REG_SCU_3,
 					SCU3_CUR_RST_GCB_BIT_MASK, 0,
-					APEX_RESET_DELAY, APEX_RESET_RETRY)) {
+					APEX_RESET_RETRY, APEX_RESET_DELAY)) {
 		dev_err(gasket_dev->dev,
 			"GCB did not leave reset within timeout (%d ms)\n",
 			APEX_RESET_RETRY * APEX_RESET_DELAY);
