@@ -5,7 +5,6 @@
 
 #include "gasket_constants.h"
 #include "gasket_core.h"
-#include "gasket_sysfs.h"
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/printk.h>
@@ -71,10 +70,6 @@ struct gasket_interrupt_data {
 	int irq;
 };
 
-/* Structures to display interrupt counts in sysfs. */
-enum interrupt_sysfs_attribute_type {
-	ATTR_INTERRUPT_COUNTS,
-};
 
 /* Set up device registers for interrupt handling. */
 static void gasket_interrupt_setup(struct gasket_dev *gasket_dev)
@@ -268,61 +263,21 @@ static void force_msix_interrupt_unmasking(struct gasket_dev *gasket_dev)
 #undef APEX_BAR2_REG_KERNEL_HIB_MSIX_TABLE
 }
 
-static ssize_t interrupt_sysfs_show(struct device *device,
-				    struct device_attribute *attr, char *buf)
+/* Show the per-interrupt counters (sysfs "interrupt_counts"). */
+ssize_t gasket_interrupt_counts_show(struct gasket_dev *gasket_dev, char *buf)
 {
-	int i, ret;
-	ssize_t written = 0, total_written = 0;
-	struct gasket_interrupt_data *interrupt_data;
-	struct gasket_dev *gasket_dev;
-	struct gasket_sysfs_attribute *gasket_attr;
-	enum interrupt_sysfs_attribute_type sysfs_type;
+	struct gasket_interrupt_data *interrupt_data = gasket_dev->interrupt_data;
+	ssize_t ret = 0;
+	int i;
 
-	gasket_dev = gasket_sysfs_get_device_data(device);
-	if (!gasket_dev) {
-		dev_dbg(device, "No sysfs mapping found for device\n");
-		return 0;
-	}
+	if (!interrupt_data)
+		return -ENODEV;
 
-	gasket_attr = gasket_sysfs_get_attr(device, attr);
-	if (!gasket_attr) {
-		dev_dbg(device, "No sysfs attr data found for device\n");
-		gasket_sysfs_put_device_data(device, gasket_dev);
-		return 0;
-	}
-
-	sysfs_type = (enum interrupt_sysfs_attribute_type)
-		gasket_attr->data.attr_type;
-	interrupt_data = gasket_dev->interrupt_data;
-	switch (sysfs_type) {
-	case ATTR_INTERRUPT_COUNTS:
-		for (i = 0; i < interrupt_data->num_interrupts; ++i) {
-			written =
-				scnprintf(buf, PAGE_SIZE - total_written,
-					  "0x%02x: %ld\n", i,
-					  interrupt_data->interrupt_counts[i]);
-			total_written += written;
-			buf += written;
-		}
-		ret = total_written;
-		break;
-	default:
-		dev_dbg(gasket_dev->dev, "Unknown attribute: %s\n",
-			attr->attr.name);
-		ret = 0;
-		break;
-	}
-
-	gasket_sysfs_put_attr(device, gasket_attr);
-	gasket_sysfs_put_device_data(device, gasket_dev);
+	for (i = 0; i < interrupt_data->num_interrupts; ++i)
+		ret += sysfs_emit_at(buf, ret, "0x%02x: %ld\n", i,
+				     interrupt_data->interrupt_counts[i]);
 	return ret;
 }
-
-static struct gasket_sysfs_attribute interrupt_sysfs_attrs[] = {
-	GASKET_SYSFS_RO(interrupt_counts, interrupt_sysfs_show,
-			ATTR_INTERRUPT_COUNTS),
-	GASKET_END_OF_ATTR_ARRAY,
-};
 
 int gasket_interrupt_init(struct gasket_dev *gasket_dev)
 {
@@ -390,8 +345,6 @@ int gasket_interrupt_init(struct gasket_dev *gasket_dev)
 	}
 
 	gasket_interrupt_setup(gasket_dev);
-	gasket_sysfs_create_entries(gasket_dev->dev_info.device,
-				    interrupt_sysfs_attrs);
 
 	return 0;
 }

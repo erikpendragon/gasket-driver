@@ -25,7 +25,6 @@
 #include "gasket_core.h"
 #include "gasket_interrupt.h"
 #include "gasket_page_table.h"
-#include "gasket_sysfs.h"
 
 /* Constants */
 #define APEX_DEVICE_NAME "Apex"
@@ -643,47 +642,31 @@ static int millic_to_adc(int millic)
 static ssize_t sysfs_show(struct device *device, struct device_attribute *attr,
 			  char *buf)
 {
-	int ret;
-	unsigned value, value2, value3, value4;
-	struct gasket_dev *gasket_dev;
+	ssize_t ret;
+	unsigned int value, value2, value3, value4;
+	struct gasket_dev *gasket_dev = dev_get_drvdata(device);
 	struct apex_dev *apex_dev;
-	struct gasket_sysfs_attribute *gasket_attr;
-	enum sysfs_attribute_type type;
 
-	gasket_dev = gasket_sysfs_get_device_data(device);
-	if (!gasket_dev) {
-		dev_err(device, "No Apex device sysfs mapping found\n");
+	/* Until probe has finished there is no apex_dev and no BAR mapping. */
+	if (!gasket_dev || !gasket_dev->pci_dev ||
+	    !(apex_dev = pci_get_drvdata(gasket_dev->pci_dev)) ||
+	    !gasket_dev->page_table[0] ||
+	    !gasket_dev->bar_data[APEX_BAR_INDEX].virt_base)
 		return -ENODEV;
-	}
 
-	if (!gasket_dev->pci_dev ||
-	    !(apex_dev = pci_get_drvdata(gasket_dev->pci_dev))) {
-		dev_err(device, "Can't find apex_dev data\n");
-		gasket_sysfs_put_device_data(device, gasket_dev);
-		return -ENODEV;
-	}
-
-	gasket_attr = gasket_sysfs_get_attr(device, attr);
-	if (!gasket_attr) {
-		dev_err(device, "No Apex device sysfs attr data found\n");
-		gasket_sysfs_put_device_data(device, gasket_dev);
-		return -ENODEV;
-	}
-
-	type = (enum sysfs_attribute_type)gasket_attr->data.attr_type;
-	switch (type) {
+	switch (gasket_attr_type(attr)) {
 	case ATTR_KERNEL_HIB_PAGE_TABLE_SIZE:
-		ret = scnprintf(buf, PAGE_SIZE, "%u\n",
+		ret = sysfs_emit(buf, "%u\n",
 				gasket_page_table_num_entries(
 					gasket_dev->page_table[0]));
 		break;
 	case ATTR_KERNEL_HIB_SIMPLE_PAGE_TABLE_SIZE:
-		ret = scnprintf(buf, PAGE_SIZE, "%u\n",
+		ret = sysfs_emit(buf, "%u\n",
 				gasket_page_table_num_simple_entries(
 					gasket_dev->page_table[0]));
 		break;
 	case ATTR_KERNEL_HIB_NUM_ACTIVE_PAGES:
-		ret = scnprintf(buf, PAGE_SIZE, "%u\n",
+		ret = sysfs_emit(buf, "%u\n",
 				gasket_page_table_num_active_pages(
 					gasket_dev->page_table[0]));
 		break;
@@ -691,38 +674,38 @@ static ssize_t sysfs_show(struct device *device, struct device_attribute *attr,
 		value = gasket_dev_read_32(gasket_dev, APEX_BAR_INDEX,
 					   APEX_BAR2_REG_OMC0_DC);
 		value = (value >> 16) & ((1 << 10) - 1);
-		ret = scnprintf(buf, PAGE_SIZE, "%i\n", adc_to_millic(value));
+		ret = sysfs_emit(buf, "%i\n", adc_to_millic(value));
 		break;
 	case ATTR_TEMP_WARN1:
-		ret = scnprintf(buf, PAGE_SIZE, "%i\n",
+		ret = sysfs_emit(buf, "%i\n",
 				adc_to_millic(apex_dev->hw_temp_warn1_adc));
 		break;
 	case ATTR_TEMP_WARN2:
-		ret = scnprintf(buf, PAGE_SIZE, "%i\n",
+		ret = sysfs_emit(buf, "%i\n",
 				adc_to_millic(apex_dev->hw_temp_warn2_adc));
 		break;
 	case ATTR_TEMP_WARN1_EN:
-		ret = scnprintf(buf, PAGE_SIZE, "%i\n",
+		ret = sysfs_emit(buf, "%i\n",
 				apex_dev->hw_temp_warn1_en);
 		break;
 	case ATTR_TEMP_WARN2_EN:
-		ret = scnprintf(buf, PAGE_SIZE, "%i\n",
+		ret = sysfs_emit(buf, "%i\n",
 				apex_dev->hw_temp_warn2_en);
 		break;
 	case ATTR_TEMP_TRIP0:
-		ret = scnprintf(buf, PAGE_SIZE, "%i\n",
+		ret = sysfs_emit(buf, "%i\n",
 				adc_to_millic(apex_dev->adc_trip_points[0]));
 		break;
 	case ATTR_TEMP_TRIP1:
-		ret = scnprintf(buf, PAGE_SIZE, "%i\n",
+		ret = sysfs_emit(buf, "%i\n",
 				adc_to_millic(apex_dev->adc_trip_points[1]));
 		break;
 	case ATTR_TEMP_TRIP2:
-		ret = scnprintf(buf, PAGE_SIZE, "%i\n",
+		ret = sysfs_emit(buf, "%i\n",
 				adc_to_millic(apex_dev->adc_trip_points[2]));
 		break;
 	case ATTR_TEMP_POLL_INTERVAL:
-		ret = scnprintf(buf, PAGE_SIZE, "%i\n",
+		ret = sysfs_emit(buf, "%i\n",
 				atomic_read(&apex_dev->temp_poll_interval));
 		break;
 	case ATTR_UNIQUE_ID:
@@ -734,19 +717,15 @@ static ssize_t sysfs_show(struct device *device, struct device_attribute *attr,
 					    APEX_BAR2_REG_EFUSE_E4);
 		value4 = gasket_dev_read_32(gasket_dev, APEX_BAR_INDEX,
 					    APEX_BAR2_REG_EFUSE_E8);
-		ret = snprintf(buf, PAGE_SIZE, "%.8x%.8x%.8x%.8x\n", value4,
-			       value3, value2, value);
+		ret = sysfs_emit(buf, "%.8x%.8x%.8x%.8x\n", value4, value3,
+				 value2, value);
 		break;
 
 	default:
-		dev_dbg(gasket_dev->dev, "Unknown attribute: %s\n",
-			attr->attr.name);
-		ret = 0;
+		ret = -EINVAL;
 		break;
 	}
 
-	gasket_sysfs_put_attr(device, gasket_attr);
-	gasket_sysfs_put_device_data(device, gasket_dev);
 	return ret;
 }
 
@@ -754,37 +733,20 @@ static ssize_t sysfs_show(struct device *device, struct device_attribute *attr,
 static ssize_t sysfs_store(struct device *device, struct device_attribute *attr,
 			   const char *buf, size_t count)
 {
-	int ret = count, value;
-	struct gasket_dev *gasket_dev;
+	ssize_t ret = count;
+	int value;
+	struct gasket_dev *gasket_dev = dev_get_drvdata(device);
 	struct apex_dev *apex_dev;
-	struct gasket_sysfs_attribute *gasket_attr;
-	enum sysfs_attribute_type type;
 
 	if (kstrtoint(buf, 10, &value))
 		return -EINVAL;
 
-	gasket_dev = gasket_sysfs_get_device_data(device);
-	if (!gasket_dev) {
-		dev_err(device, "No Apex device sysfs mapping found\n");
+	if (!gasket_dev || !gasket_dev->pci_dev ||
+	    !(apex_dev = pci_get_drvdata(gasket_dev->pci_dev)) ||
+	    !gasket_dev->bar_data[APEX_BAR_INDEX].virt_base)
 		return -ENODEV;
-	}
 
-	if (!gasket_dev->pci_dev ||
-	    !(apex_dev = pci_get_drvdata(gasket_dev->pci_dev))) {
-		dev_err(device, "Can't find apex_dev data\n");
-		gasket_sysfs_put_device_data(device, gasket_dev);
-		return -ENODEV;
-	}
-
-	gasket_attr = gasket_sysfs_get_attr(device, attr);
-	if (!gasket_attr) {
-		dev_err(device, "No Apex device sysfs attr data found\n");
-		gasket_sysfs_put_device_data(device, gasket_dev);
-		return -ENODEV;
-	}
-
-	type = (enum sysfs_attribute_type)gasket_attr->data.attr_type;
-	switch (type) {
+	switch (gasket_attr_type(attr)) {
 	case ATTR_TEMP_WARN1:
 		value = millic_to_adc(value);
 		gasket_read_modify_write_32(gasket_dev, APEX_BAR_INDEX,
@@ -842,43 +804,55 @@ static ssize_t sysfs_store(struct device *device, struct device_attribute *attr,
 
 		break;
 	default:
-		dev_dbg(gasket_dev->dev, "Unknown attribute: %s\n",
-			attr->attr.name);
-		ret = 0;
+		ret = -EINVAL;
 		break;
 	}
 
-	gasket_sysfs_put_attr(device, gasket_attr);
-	gasket_sysfs_put_device_data(device, gasket_dev);
 	return ret;
 }
 
-static struct gasket_sysfs_attribute apex_sysfs_attrs[] = {
-	GASKET_SYSFS_RO(node_0_page_table_entries, sysfs_show,
-			ATTR_KERNEL_HIB_PAGE_TABLE_SIZE),
-	GASKET_SYSFS_RO(node_0_simple_page_table_entries, sysfs_show,
-			ATTR_KERNEL_HIB_SIMPLE_PAGE_TABLE_SIZE),
-	GASKET_SYSFS_RO(node_0_num_mapped_pages, sysfs_show,
-			ATTR_KERNEL_HIB_NUM_ACTIVE_PAGES),
-	GASKET_SYSFS_RO(temp, sysfs_show, ATTR_TEMP),
-	GASKET_SYSFS_RW(hw_temp_warn1, sysfs_show, sysfs_store,
-			ATTR_TEMP_WARN1),
-	GASKET_SYSFS_RW(hw_temp_warn1_en, sysfs_show, sysfs_store,
-			ATTR_TEMP_WARN1_EN),
-	GASKET_SYSFS_RW(hw_temp_warn2, sysfs_show, sysfs_store,
-			ATTR_TEMP_WARN2),
-	GASKET_SYSFS_RW(hw_temp_warn2_en, sysfs_show, sysfs_store,
-			ATTR_TEMP_WARN2_EN),
-	GASKET_SYSFS_RW(trip_point0_temp, sysfs_show, sysfs_store,
-			ATTR_TEMP_TRIP0),
-	GASKET_SYSFS_RW(trip_point1_temp, sysfs_show, sysfs_store,
-			ATTR_TEMP_TRIP1),
-	GASKET_SYSFS_RW(trip_point2_temp, sysfs_show, sysfs_store,
-			ATTR_TEMP_TRIP2),
-	GASKET_SYSFS_RW(temp_poll_interval, sysfs_show, sysfs_store,
-			ATTR_TEMP_POLL_INTERVAL),
-	GASKET_SYSFS_RO(unique_id, sysfs_show, ATTR_UNIQUE_ID),
-	GASKET_END_OF_ATTR_ARRAY
+static GASKET_ATTR_RO(node_0_page_table_entries, sysfs_show,
+		      ATTR_KERNEL_HIB_PAGE_TABLE_SIZE);
+static GASKET_ATTR_RO(node_0_simple_page_table_entries, sysfs_show,
+		      ATTR_KERNEL_HIB_SIMPLE_PAGE_TABLE_SIZE);
+static GASKET_ATTR_RO(node_0_num_mapped_pages, sysfs_show,
+		      ATTR_KERNEL_HIB_NUM_ACTIVE_PAGES);
+static GASKET_ATTR_RO(temp, sysfs_show, ATTR_TEMP);
+static GASKET_ATTR_RW(hw_temp_warn1, sysfs_show, sysfs_store, ATTR_TEMP_WARN1);
+static GASKET_ATTR_RW(hw_temp_warn1_en, sysfs_show, sysfs_store,
+		      ATTR_TEMP_WARN1_EN);
+static GASKET_ATTR_RW(hw_temp_warn2, sysfs_show, sysfs_store, ATTR_TEMP_WARN2);
+static GASKET_ATTR_RW(hw_temp_warn2_en, sysfs_show, sysfs_store,
+		      ATTR_TEMP_WARN2_EN);
+static GASKET_ATTR_RW(trip_point0_temp, sysfs_show, sysfs_store,
+		      ATTR_TEMP_TRIP0);
+static GASKET_ATTR_RW(trip_point1_temp, sysfs_show, sysfs_store,
+		      ATTR_TEMP_TRIP1);
+static GASKET_ATTR_RW(trip_point2_temp, sysfs_show, sysfs_store,
+		      ATTR_TEMP_TRIP2);
+static GASKET_ATTR_RW(temp_poll_interval, sysfs_show, sysfs_store,
+		      ATTR_TEMP_POLL_INTERVAL);
+static GASKET_ATTR_RO(unique_id, sysfs_show, ATTR_UNIQUE_ID);
+
+static struct attribute *apex_attrs[] = {
+	&gasket_attr_node_0_page_table_entries.attr.attr,
+	&gasket_attr_node_0_simple_page_table_entries.attr.attr,
+	&gasket_attr_node_0_num_mapped_pages.attr.attr,
+	&gasket_attr_temp.attr.attr,
+	&gasket_attr_hw_temp_warn1.attr.attr,
+	&gasket_attr_hw_temp_warn1_en.attr.attr,
+	&gasket_attr_hw_temp_warn2.attr.attr,
+	&gasket_attr_hw_temp_warn2_en.attr.attr,
+	&gasket_attr_trip_point0_temp.attr.attr,
+	&gasket_attr_trip_point1_temp.attr.attr,
+	&gasket_attr_trip_point2_temp.attr.attr,
+	&gasket_attr_temp_poll_interval.attr.attr,
+	&gasket_attr_unique_id.attr.attr,
+	NULL,
+};
+
+static const struct attribute_group apex_attr_group = {
+	.attrs = apex_attrs,
 };
 
 /* Stores kernel module parameters to device specific data buffer */
@@ -1076,11 +1050,6 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 
 	enable_thermal_sensing(gasket_dev);
 
-	ret = gasket_sysfs_create_entries(gasket_dev->dev_info.device,
-					  apex_sysfs_attrs);
-	if (ret)
-		dev_err(&pci_dev->dev, "error creating device sysfs entries\n");
-
 	ret = gasket_enable_device(gasket_dev);
 	if (ret) {
 		dev_err(&pci_dev->dev, "error enabling gasket device\n");
@@ -1195,6 +1164,7 @@ static struct gasket_driver_desc apex_desc = {
 	.num_interrupts = APEX_INTERRUPT_COUNT,
 	.interrupts = apex_interrupts,
 	.interrupt_pack_width = 7,
+	.sysfs_group = &apex_attr_group,
 
 	.device_open_cb = apex_device_open_cb,
 	.device_close_cb = apex_device_cleanup,

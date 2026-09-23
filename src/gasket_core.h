@@ -20,6 +20,33 @@
 
 #include "gasket_constants.h"
 
+/*
+ * A sysfs attribute plus a small integer that tells a shared show/store
+ * function which value to report. The class device's driver data is the
+ * struct gasket_dev.
+ */
+struct gasket_attr {
+	struct device_attribute attr;
+	int type;
+};
+
+#define GASKET_ATTR_RO(_name, _show, _type)                                    \
+	struct gasket_attr gasket_attr_##_name = {                             \
+		.attr = __ATTR(_name, 0444, _show, NULL),                      \
+		.type = _type,                                                 \
+	}
+
+#define GASKET_ATTR_RW(_name, _show, _store, _type)                            \
+	struct gasket_attr gasket_attr_##_name = {                             \
+		.attr = __ATTR(_name, 0664, _show, _store),                    \
+		.type = _type,                                                 \
+	}
+
+static inline int gasket_attr_type(struct device_attribute *attr)
+{
+	return container_of(attr, struct gasket_attr, attr)->type;
+}
+
 /**
  * struct gasket_num_name - Map numbers to names.
  * @ein_num: Number.
@@ -404,6 +431,9 @@ struct gasket_driver_desc {
 	 * packed interrupts are not used, this value is ignored.
 	 */
 	int interrupt_pack_width;
+
+	/* Driver-specific sysfs attributes on the class device, or NULL. */
+	const struct attribute_group *sysfs_group;
 
 	/* Driver callback functions - all may be NULL */
 	/*

@@ -105,4 +105,7 @@ int gasket_interrupt_clear_eventfd(struct gasket_interrupt_data *interrupt_data,
 
 int gasket_interrupt_system_status(struct gasket_dev *gasket_dev);
 
+/* Format the per-interrupt counters for sysfs. */
+ssize_t gasket_interrupt_counts_show(struct gasket_dev *gasket_dev, char *buf);
+
 #endif

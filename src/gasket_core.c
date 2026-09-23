@@ -15,7 +15,6 @@
 #include "gasket_interrupt.h"
 #include "gasket_ioctl.h"
 #include "gasket_page_table.h"
-#include "gasket_sysfs.h"
 
 #include <linux/capability.h>
 #include <linux/compiler.h>
@@ -56,6 +55,9 @@ struct gasket_internal_desc {
 
 	/* Instantiated / present devices of this type. */
 	struct gasket_dev *devs[GASKET_DEV_MAX];
+
+	/* sysfs groups for the class devices: framework, driver, NULL. */
+	const struct attribute_group *groups[3];
 };
 
 /* do_map_region() needs be able to return more than just true/false. */
@@ -102,7 +104,8 @@ enum gasket_sysfs_attribute_type {
 	ATTR_DEVICE_OWNER,
 	ATTR_WRITE_OPEN_COUNT,
 	ATTR_RESET_COUNT,
-	ATTR_USER_MEM_RANGES
+	ATTR_USER_MEM_RANGES,
+	ATTR_INTERRUPT_COUNTS,
 };
 
 /* On some arm64 systems pcie dma controller can only access lower 4GB of
@@ -241,8 +244,10 @@ static int gasket_alloc_dev(struct gasket_internal_desc *internal_desc,
 		MKDEV(driver_desc->major, driver_desc->minor +
 		      gasket_dev->dev_idx);
 	dev_info->device =
-		device_create(internal_desc->class, parent, dev_info->devt,
-			      gasket_dev, dev_info->name);
+		device_create_with_groups(internal_desc->class, parent,
+					  dev_info->devt, gasket_dev,
+					  internal_desc->groups, "%s",
+					  dev_info->name);
 
 	/* cdev has not yet been added; cdev_added is 0 */
 	dev_info->gasket_dev_ptr = gasket_dev;
@@ -450,31 +455,27 @@ static int gasket_get_hw_status(struct gasket_dev *gasket_dev)
 }
 
 static ssize_t
-gasket_write_mappable_regions(char *buf,
+gasket_write_mappable_regions(char *buf, ssize_t at,
 			      const struct gasket_driver_desc *driver_desc,
 			      int bar_index)
 {
 	int i;
-	ssize_t written;
 	ssize_t total_written = 0;
 	ulong min_addr, max_addr;
-	struct gasket_bar_desc bar_desc =
-		driver_desc->bar_descriptions[bar_index];
+	const struct gasket_bar_desc *bar_desc =
+		&driver_desc->bar_descriptions[bar_index];
 
-	if (bar_desc.permissions == GASKET_NOMAP)
+	if (bar_desc->permissions == GASKET_NOMAP)
 		return 0;
-	for (i = 0;
-	     i < bar_desc.num_mappable_regions && total_written < PAGE_SIZE;
-	     i++) {
-		min_addr = bar_desc.mappable_regions[i].start -
+	for (i = 0; i < bar_desc->num_mappable_regions; i++) {
+		min_addr = bar_desc->mappable_regions[i].start -
 			   driver_desc->legacy_mmap_address_offset;
-		max_addr = bar_desc.mappable_regions[i].start -
+		max_addr = bar_desc->mappable_regions[i].start -
 			   driver_desc->legacy_mmap_address_offset +
-			   bar_desc.mappable_regions[i].length_bytes;
-		written = scnprintf(buf, PAGE_SIZE - total_written,
-				    "0x%08lx-0x%08lx\n", min_addr, max_addr);
-		total_written += written;
-		buf += written;
+			   bar_desc->mappable_regions[i].length_bytes;
+		total_written += sysfs_emit_at(buf, at + total_written,
+					       "0x%08lx-0x%08lx\n",
+					       min_addr, max_addr);
 	}
 	return total_written;
 }
@@ -482,42 +483,25 @@ gasket_write_mappable_regions(char *buf,
 static ssize_t gasket_sysfs_data_show(struct device *device,
 				      struct device_attribute *attr, char *buf)
 {
-	int i, ret = 0;
-	ssize_t current_written = 0;
+	int i;
+	ssize_t ret = 0;
+	struct gasket_dev *gasket_dev = dev_get_drvdata(device);
 	const struct gasket_driver_desc *driver_desc;
-	struct gasket_dev *gasket_dev;
-	struct gasket_sysfs_attribute *gasket_attr;
 	const struct gasket_bar_desc *bar_desc;
-	enum gasket_sysfs_attribute_type sysfs_type;
 
-	gasket_dev = gasket_sysfs_get_device_data(device);
-	if (!gasket_dev) {
-		dev_err(device, "No sysfs mapping found for device\n");
-		return 0;
-	}
-
-	gasket_attr = gasket_sysfs_get_attr(device, attr);
-	if (!gasket_attr) {
-		dev_err(device, "No sysfs attr found for device\n");
-		gasket_sysfs_put_device_data(device, gasket_dev);
-		return 0;
-	}
+	if (!gasket_dev)
+		return -ENODEV;
 
 	driver_desc = gasket_dev->internal_desc->driver_desc;
 
-	sysfs_type =
-		(enum gasket_sysfs_attribute_type)gasket_attr->data.attr_type;
-	switch (sysfs_type) {
+	switch (gasket_attr_type(attr)) {
 	case ATTR_BAR_OFFSETS:
 		for (i = 0; i < GASKET_NUM_BARS; i++) {
 			bar_desc = &driver_desc->bar_descriptions[i];
 			if (bar_desc->size == 0)
 				continue;
-			current_written =
-				snprintf(buf, PAGE_SIZE - ret, "%d: 0x%lx\n", i,
-					 (ulong)bar_desc->base);
-			buf += current_written;
-			ret += current_written;
+			ret += sysfs_emit_at(buf, ret, "%d: 0x%lx\n", i,
+					     (ulong)bar_desc->base);
 		}
 		break;
 	case ATTR_BAR_SIZES:
@@ -525,96 +509,104 @@ static ssize_t gasket_sysfs_data_show(struct device *device,
 			bar_desc = &driver_desc->bar_descriptions[i];
 			if (bar_desc->size == 0)
 				continue;
-			current_written =
-				snprintf(buf, PAGE_SIZE - ret, "%d: 0x%lx\n", i,
-					 (ulong)bar_desc->size);
-			buf += current_written;
-			ret += current_written;
+			ret += sysfs_emit_at(buf, ret, "%d: 0x%lx\n", i,
+					     (ulong)bar_desc->size);
 		}
 		break;
 	case ATTR_DRIVER_VERSION:
-		ret = snprintf(buf, PAGE_SIZE, "%s\n",
-			       gasket_dev->internal_desc->driver_desc->driver_version);
+		ret = sysfs_emit(buf, "%s\n", driver_desc->driver_version);
 		break;
 	case ATTR_FRAMEWORK_VERSION:
-		ret = snprintf(buf, PAGE_SIZE, "%s\n",
-			       GASKET_FRAMEWORK_VERSION);
+		ret = sysfs_emit(buf, "%s\n", GASKET_FRAMEWORK_VERSION);
 		break;
 	case ATTR_DEVICE_TYPE:
-		ret = snprintf(buf, PAGE_SIZE, "%s\n",
-			       gasket_dev->internal_desc->driver_desc->name);
+		ret = sysfs_emit(buf, "%s\n", driver_desc->name);
 		break;
 	case ATTR_HARDWARE_REVISION:
-		ret = snprintf(buf, PAGE_SIZE, "%d\n",
-			       gasket_dev->hardware_revision);
+		ret = sysfs_emit(buf, "%d\n", gasket_dev->hardware_revision);
 		break;
 	case ATTR_PCI_ADDRESS:
-		ret = snprintf(buf, PAGE_SIZE, "%s\n", gasket_dev->kobj_name);
+		ret = sysfs_emit(buf, "%s\n", gasket_dev->kobj_name);
 		break;
 	case ATTR_STATUS:
-		ret = snprintf(buf, PAGE_SIZE, "%s\n",
-			       gasket_num_name_lookup(gasket_dev->status,
-						      gasket_status_name_table));
+		ret = sysfs_emit(buf, "%s\n",
+				 gasket_num_name_lookup(gasket_dev->status,
+							gasket_status_name_table));
 		break;
 	case ATTR_IS_DEVICE_OWNED:
-		ret = snprintf(buf, PAGE_SIZE, "%d\n",
-			       gasket_dev->dev_info.ownership.is_owned);
+		ret = sysfs_emit(buf, "%d\n",
+				 gasket_dev->dev_info.ownership.is_owned);
 		break;
 	case ATTR_DEVICE_OWNER:
-		ret = snprintf(buf, PAGE_SIZE, "%d\n",
-			       gasket_dev->dev_info.ownership.owner);
+		ret = sysfs_emit(buf, "%d\n",
+				 gasket_dev->dev_info.ownership.owner);
 		break;
 	case ATTR_WRITE_OPEN_COUNT:
-		ret = snprintf(buf, PAGE_SIZE, "%d\n",
-			       gasket_dev->dev_info.ownership.write_open_count);
+		ret = sysfs_emit(buf, "%d\n",
+				 gasket_dev->dev_info.ownership.write_open_count);
 		break;
 	case ATTR_RESET_COUNT:
-		ret = snprintf(buf, PAGE_SIZE, "%d\n", gasket_dev->reset_count);
+		ret = sysfs_emit(buf, "%d\n", gasket_dev->reset_count);
 		break;
 	case ATTR_USER_MEM_RANGES:
-		for (i = 0; i < GASKET_NUM_BARS; ++i) {
-			current_written =
-				gasket_write_mappable_regions(buf, driver_desc,
-							      i);
-			buf += current_written;
-			ret += current_written;
-		}
+		for (i = 0; i < GASKET_NUM_BARS; ++i)
+			ret += gasket_write_mappable_regions(buf, ret,
+							     driver_desc, i);
+		break;
+	case ATTR_INTERRUPT_COUNTS:
+		ret = gasket_interrupt_counts_show(gasket_dev, buf);
 		break;
 	default:
-		dev_dbg(gasket_dev->dev, "Unknown attribute: %s\n",
-			attr->attr.name);
-		ret = 0;
+		ret = -EINVAL;
 		break;
 	}
 
-	gasket_sysfs_put_attr(device, gasket_attr);
-	gasket_sysfs_put_device_data(device, gasket_dev);
 	return ret;
 }
 
 /* These attributes apply to all Gasket driver instances. */
-static const struct gasket_sysfs_attribute gasket_sysfs_generic_attrs[] = {
-	GASKET_SYSFS_RO(bar_offsets, gasket_sysfs_data_show, ATTR_BAR_OFFSETS),
-	GASKET_SYSFS_RO(bar_sizes, gasket_sysfs_data_show, ATTR_BAR_SIZES),
-	GASKET_SYSFS_RO(driver_version, gasket_sysfs_data_show,
-			ATTR_DRIVER_VERSION),
-	GASKET_SYSFS_RO(framework_version, gasket_sysfs_data_show,
-			ATTR_FRAMEWORK_VERSION),
-	GASKET_SYSFS_RO(device_type, gasket_sysfs_data_show, ATTR_DEVICE_TYPE),
-	GASKET_SYSFS_RO(revision, gasket_sysfs_data_show,
-			ATTR_HARDWARE_REVISION),
-	GASKET_SYSFS_RO(pci_address, gasket_sysfs_data_show, ATTR_PCI_ADDRESS),
-	GASKET_SYSFS_RO(status, gasket_sysfs_data_show, ATTR_STATUS),
-	GASKET_SYSFS_RO(is_device_owned, gasket_sysfs_data_show,
-			ATTR_IS_DEVICE_OWNED),
-	GASKET_SYSFS_RO(device_owner, gasket_sysfs_data_show,
-			ATTR_DEVICE_OWNER),
-	GASKET_SYSFS_RO(write_open_count, gasket_sysfs_data_show,
-			ATTR_WRITE_OPEN_COUNT),
-	GASKET_SYSFS_RO(reset_count, gasket_sysfs_data_show, ATTR_RESET_COUNT),
-	GASKET_SYSFS_RO(user_mem_ranges, gasket_sysfs_data_show,
-			ATTR_USER_MEM_RANGES),
-	GASKET_END_OF_ATTR_ARRAY
+static GASKET_ATTR_RO(bar_offsets, gasket_sysfs_data_show, ATTR_BAR_OFFSETS);
+static GASKET_ATTR_RO(bar_sizes, gasket_sysfs_data_show, ATTR_BAR_SIZES);
+static GASKET_ATTR_RO(driver_version, gasket_sysfs_data_show,
+		      ATTR_DRIVER_VERSION);
+static GASKET_ATTR_RO(framework_version, gasket_sysfs_data_show,
+		      ATTR_FRAMEWORK_VERSION);
+static GASKET_ATTR_RO(device_type, gasket_sysfs_data_show, ATTR_DEVICE_TYPE);
+static GASKET_ATTR_RO(revision, gasket_sysfs_data_show,
+		      ATTR_HARDWARE_REVISION);
+static GASKET_ATTR_RO(pci_address, gasket_sysfs_data_show, ATTR_PCI_ADDRESS);
+static GASKET_ATTR_RO(status, gasket_sysfs_data_show, ATTR_STATUS);
+static GASKET_ATTR_RO(is_device_owned, gasket_sysfs_data_show,
+		      ATTR_IS_DEVICE_OWNED);
+static GASKET_ATTR_RO(device_owner, gasket_sysfs_data_show, ATTR_DEVICE_OWNER);
+static GASKET_ATTR_RO(write_open_count, gasket_sysfs_data_show,
+		      ATTR_WRITE_OPEN_COUNT);
+static GASKET_ATTR_RO(reset_count, gasket_sysfs_data_show, ATTR_RESET_COUNT);
+static GASKET_ATTR_RO(user_mem_ranges, gasket_sysfs_data_show,
+		      ATTR_USER_MEM_RANGES);
+static GASKET_ATTR_RO(interrupt_counts, gasket_sysfs_data_show,
+		      ATTR_INTERRUPT_COUNTS);
+
+static struct attribute *gasket_generic_attrs[] = {
+	&gasket_attr_bar_offsets.attr.attr,
+	&gasket_attr_bar_sizes.attr.attr,
+	&gasket_attr_driver_version.attr.attr,
+	&gasket_attr_framework_version.attr.attr,
+	&gasket_attr_device_type.attr.attr,
+	&gasket_attr_revision.attr.attr,
+	&gasket_attr_pci_address.attr.attr,
+	&gasket_attr_status.attr.attr,
+	&gasket_attr_is_device_owned.attr.attr,
+	&gasket_attr_device_owner.attr.attr,
+	&gasket_attr_write_open_count.attr.attr,
+	&gasket_attr_reset_count.attr.attr,
+	&gasket_attr_user_mem_ranges.attr.attr,
+	&gasket_attr_interrupt_counts.attr.attr,
+	NULL,
+};
+
+static const struct attribute_group gasket_generic_group = {
+	.attrs = gasket_generic_attrs,
 };
 
 /* Add a char device and related info. */
@@ -1465,23 +1457,9 @@ static int __gasket_add_device(struct device *parent_dev,
 		goto free_gasket_dev;
 	}
 
-	ret = gasket_sysfs_create_mapping(gasket_dev->dev_info.device,
-					  gasket_dev);
-	if (ret)
-		goto remove_device;
-
-	ret = gasket_sysfs_create_entries(gasket_dev->dev_info.device,
-					  gasket_sysfs_generic_attrs);
-	if (ret)
-		goto remove_sysfs_mapping;
-
 	*gasket_devp = gasket_dev;
 	return 0;
 
-remove_sysfs_mapping:
-	gasket_sysfs_remove_mapping(gasket_dev->dev_info.device);
-remove_device:
-	device_destroy(internal_desc->class, gasket_dev->dev_info.devt);
 free_gasket_dev:
 	gasket_free_dev(gasket_dev);
 	return ret;
@@ -1490,7 +1468,6 @@ free_gasket_dev:
 static void __gasket_remove_device(struct gasket_internal_desc *internal_desc,
 				   struct gasket_dev *gasket_dev)
 {
-	gasket_sysfs_remove_mapping(gasket_dev->dev_info.device);
 	device_destroy(internal_desc->class, gasket_dev->dev_info.devt);
 	gasket_free_dev(gasket_dev);
 }
@@ -1836,6 +1813,9 @@ int gasket_register_device(const struct gasket_driver_desc *driver_desc)
 
 	internal = &g_descs[desc_idx];
 	mutex_init(&internal->mutex);
+	internal->groups[0] = &gasket_generic_group;
+	internal->groups[1] = driver_desc->sysfs_group;
+	internal->groups[2] = NULL;
 	memset(internal->devs, 0, sizeof(struct gasket_dev *) * GASKET_DEV_MAX);
 
 	internal->class = class_create(driver_desc->name);
@@ -1914,8 +1894,6 @@ static int __init gasket_init(void)
 		g_descs[i].driver_desc = NULL;
 		mutex_init(&g_descs[i].mutex);
 	}
-
-	gasket_sysfs_init();
 
 	mutex_unlock(&g_mutex);
 	return 0;
