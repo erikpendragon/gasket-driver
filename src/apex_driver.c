@@ -8,6 +8,7 @@
 #include <linux/atomic.h>
 #include <linux/compiler.h>
 #include <linux/delay.h>
+#include <linux/hwmon.h>
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -84,6 +85,9 @@ struct apex_dev {
 	 */
 	u32 perf_clk_div;
 	u32 thermal_clk_div;
+
+	/* Standard temperature sensor (see "sensors"), or NULL. */
+	struct device *hwmon;
 };
 
 /* Cool this far below a trip point before the throttle is lifted. */
@@ -1082,6 +1086,64 @@ static void apex_pci_fixup_class(struct pci_dev *pdev)
 DECLARE_PCI_FIXUP_CLASS_HEADER(APEX_PCI_VENDOR_ID, APEX_PCI_DEVICE_ID,
 			       PCI_ANY_ID, 8, apex_pci_fixup_class);
 
+/*
+ * hwmon: temp1_input is the die temperature; temp1_max and temp1_crit are
+ * the first and last thermal throttle points. All in millidegrees C.
+ */
+static umode_t apex_hwmon_is_visible(const void *data,
+				     enum hwmon_sensor_types type, u32 attr,
+				     int channel)
+{
+	return 0444;
+}
+
+static int apex_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+			   u32 attr, int channel, long *val)
+{
+	struct apex_dev *apex_dev = dev_get_drvdata(dev);
+	struct gasket_dev *gasket_dev = apex_dev->gasket_dev_ptr;
+	u32 reg;
+	int ret = 0;
+
+	mutex_lock(&gasket_dev->mutex);
+	switch (attr) {
+	case hwmon_temp_input:
+		reg = gasket_dev_read_32(gasket_dev, APEX_BAR_INDEX,
+					 APEX_BAR2_REG_OMC0_DC);
+		if (reg == U32_MAX) {
+			ret = -ENODATA;
+			break;
+		}
+		*val = adc_to_millic((reg >> 16) & ((1 << 10) - 1));
+		break;
+	case hwmon_temp_max:
+		*val = adc_to_millic(apex_dev->adc_trip_points[0]);
+		break;
+	case hwmon_temp_crit:
+		*val = adc_to_millic(apex_dev->adc_trip_points[2]);
+		break;
+	default:
+		ret = -EOPNOTSUPP;
+	}
+	mutex_unlock(&gasket_dev->mutex);
+	return ret;
+}
+
+static const struct hwmon_channel_info *const apex_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_MAX | HWMON_T_CRIT),
+	NULL,
+};
+
+static const struct hwmon_ops apex_hwmon_ops = {
+	.is_visible = apex_hwmon_is_visible,
+	.read = apex_hwmon_read,
+};
+
+static const struct hwmon_chip_info apex_hwmon_chip_info = {
+	.ops = &apex_hwmon_ops,
+	.info = apex_hwmon_info,
+};
+
 static int apex_pci_probe(struct pci_dev *pci_dev,
 			  const struct pci_device_id *id)
 {
@@ -1162,6 +1224,21 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 	if (allow_power_save)
 		apex_enter_reset(gasket_dev);
 
+	/*
+	 * Not devm: apex_dev is freed in remove, so the sensor must be gone
+	 * before that. A missing sensor is not fatal.
+	 */
+	if (IS_REACHABLE(CONFIG_HWMON)) {
+		apex_dev->hwmon = hwmon_device_register_with_info(
+			&pci_dev->dev, "apex", apex_dev,
+			&apex_hwmon_chip_info, NULL);
+		if (IS_ERR(apex_dev->hwmon)) {
+			dev_warn(&pci_dev->dev, "no hwmon sensor: %ld\n",
+				 PTR_ERR(apex_dev->hwmon));
+			apex_dev->hwmon = NULL;
+		}
+	}
+
 	/* Enable thermal polling */
 	temp_poll_interval = atomic_read(&apex_dev->temp_poll_interval);
 	if (temp_poll_interval > 0)
@@ -1196,6 +1273,8 @@ static void apex_pci_remove(struct pci_dev *pci_dev)
 	 * mappings. The BARs stay mapped until gasket_pci_remove_device(), so
 	 * a poll that is still running can finish safely.
 	 */
+	if (apex_dev->hwmon)
+		hwmon_device_unregister(apex_dev->hwmon);
 	gasket_disable_device(gasket_dev);
 	cancel_delayed_work_sync(&apex_dev->check_temperature_work);
 	pci_set_drvdata(pci_dev, NULL);
