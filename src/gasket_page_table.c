@@ -459,12 +459,15 @@ int gasket_page_table_partition(struct gasket_page_table *pg_tbl,
 EXPORT_SYMBOL(gasket_page_table_partition);
 
 /*
- * Return whether a host buffer was mapped as coherent memory.
+ * Return whether a host buffer lies in the coherent memory mapping.
  *
  * A Gasket page_table currently support one contiguous dma range, mapped to one
- * contiguous virtual memory range. Check if the host_addr is within that range.
+ * contiguous virtual memory range. Returns 1 if the whole host range is inside
+ * it, 0 if the range does not start inside it, and -EINVAL if it starts inside
+ * but runs past the end (the device would be given addresses past the buffer).
  */
-static int is_coherent(struct gasket_page_table *pg_tbl, ulong host_addr)
+static int is_coherent(struct gasket_page_table *pg_tbl, ulong host_addr,
+		       uint num_pages)
 {
 	u64 min, max;
 
@@ -475,7 +478,11 @@ static int is_coherent(struct gasket_page_table *pg_tbl, ulong host_addr)
 	min = (u64)pg_tbl->coherent_pages[0].user_virt;
 	max = min + PAGE_SIZE * pg_tbl->num_coherent_pages;
 
-	return min <= host_addr && host_addr < max;
+	if (host_addr < min || host_addr >= max)
+		return 0;
+	if ((host_addr & PAGE_MASK) + (u64)num_pages * PAGE_SIZE > max)
+		return -EINVAL;
+	return 1;
 }
 
 /* Safely return a page to the OS. */
@@ -514,6 +521,7 @@ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
 	ulong page_addr;
 	int i;
 	enum dma_data_direction direction;
+	int coherent = 0;
 
 	/* Must have a virtual host address or a sg iterator, but not both. */
 	if (!((uintptr_t)host_addr ^ (uintptr_t)sg_iter)) {
@@ -526,6 +534,16 @@ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
 		dev_err(pg_tbl->device, "invalid DMA direction flags=0x%lx\n",
 			(unsigned long)flags);
 		return -EINVAL;
+	}
+
+	if (!sg_iter) {
+		coherent = is_coherent(pg_tbl, host_addr, num_pages);
+		if (coherent < 0) {
+			dev_err(pg_tbl->device,
+				"host range 0x%lx + %u pages runs past the coherent buffer\n",
+				host_addr, num_pages);
+			return coherent;
+		}
 	}
 
 	for (i = 0; i < num_pages; i++) {
@@ -541,7 +559,7 @@ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
 				container_of(sg_iter, struct sg_dma_page_iter, base));
 			ptes[i].page = NULL;
 			offset = 0;
-		} else if (is_coherent(pg_tbl, host_addr)) {
+		} else if (coherent) {
 			u64 off =
 				(u64)host_addr -
 				(u64)pg_tbl->coherent_pages[0].user_virt;
@@ -769,7 +787,7 @@ static u64 gasket_components_to_dev_address(struct gasket_page_table *pg_tbl,
 					      int is_simple, uint page_index,
 					      uint offset)
 {
-	u64 dev_addr = (page_index << GASKET_SIMPLE_PAGE_SHIFT) | offset;
+	u64 dev_addr = ((u64)page_index << GASKET_SIMPLE_PAGE_SHIFT) | offset;
 
 	return is_simple ? dev_addr : (pg_tbl->extended_flag | dev_addr);
 }
@@ -843,9 +861,13 @@ static bool gasket_is_extended_dev_addr_bad(struct gasket_page_table *pg_tbl,
 	/* Find the starting level 0 index. */
 	page_lvl0_idx = gasket_extended_lvl0_page_idx(pg_tbl, dev_addr);
 
-	/* Get the count of affected level 0 pages. */
-	num_lvl0_pages = (num_pages + GASKET_PAGES_PER_SUBTABLE - 1) /
-		GASKET_PAGES_PER_SUBTABLE;
+	/*
+	 * Get the count of affected level 0 pages. The range starts part way
+	 * into its first sub-table, so count from the start of that sub-table.
+	 */
+	num_lvl0_pages = DIV_ROUND_UP(gasket_extended_lvl1_page_idx(pg_tbl,
+								    dev_addr) +
+				      num_pages, GASKET_PAGES_PER_SUBTABLE);
 
 	if (gasket_components_to_dev_address(pg_tbl, 0, page_global_idx,
 					     page_offset) != dev_addr) {
