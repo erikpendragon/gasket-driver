@@ -76,7 +76,22 @@ struct apex_dev {
 	u32 hw_temp_warn2_adc;
 	bool hw_temp_warn1_en;
 	bool hw_temp_warn2_en;
+
+	/*
+	 * GCB clock divider (0 = full speed .. 3 = slowest) asked for by
+	 * userspace (performance ioctl) and by the thermal poller. The chip
+	 * runs at the slower of the two. Under gasket_dev->mutex.
+	 */
+	u32 perf_clk_div;
+	u32 thermal_clk_div;
 };
+
+/* Cool this far below a trip point before the throttle is lifted. */
+#define APEX_THERMAL_HYSTERESIS_MILLIC 2000
+
+/* Accepted range for sysfs/module temperatures, in millidegrees C. */
+#define APEX_TEMP_MIN_MILLIC 0
+#define APEX_TEMP_MAX_MILLIC 150000
 
 /* Enumeration of the supported sysfs entries. */
 enum sysfs_attribute_type {
@@ -553,12 +568,24 @@ static long apex_clock_gating(struct gasket_dev *gasket_dev,
 	return 0;
 }
 
+/* Write the effective GCB divider: the slower of userspace and thermal. */
+static void apex_apply_clk_div(struct apex_dev *apex_dev)
+{
+	struct gasket_dev *gasket_dev = apex_dev->gasket_dev_ptr;
+	u32 div = max(apex_dev->perf_clk_div, apex_dev->thermal_clk_div);
+
+	lockdep_assert_held(&gasket_dev->mutex);
+	gasket_read_modify_write_32(gasket_dev, APEX_BAR_INDEX,
+				    APEX_BAR2_REG_SCU_3, div, 2, 28);
+}
+
 /* apex_set_performance_expectation: Adjust clock rates for Apex. */
 static long apex_set_performance_expectation(
 	struct gasket_dev *gasket_dev,
 	struct apex_performance_expectation_ioctl __user *argp)
 {
 	struct apex_performance_expectation_ioctl ibuf;
+	struct apex_dev *apex_dev;
 	uint32_t rg_gcb_clk_div = 0;
 	uint32_t rg_axi_clk_fixed = 0;
 	const int AXI_CLK_FIXED_SHIFT = 2;
@@ -598,13 +625,24 @@ static long apex_set_performance_expectation(
 			return -EINVAL;
 	}
 
+	apex_dev = pci_get_drvdata(gasket_dev->pci_dev);
+	if (!apex_dev)
+		return -ENODEV;
+
 	/*
-	 * Set clock rates for GCB, AXI, and 8051:
+	 * Set clock rates for AXI and 8051, and the GCB divider. Thermal
+	 * throttling can only make the GCB slower than requested, never
+	 * faster, and the poller no longer undoes this request.
 	 */
-	gasket_read_modify_write_32(
-		gasket_dev, APEX_BAR_INDEX, APEX_BAR2_REG_SCU_3,
-                (rg_gcb_clk_div | (rg_axi_clk_fixed << AXI_CLK_FIXED_SHIFT) | (rg_8051_clk_fixed << MCU_CLK_FIXED_SHIFT)),
-                /*mask_width=*/4, /*mask_shift=*/28);
+	mutex_lock(&gasket_dev->mutex);
+	apex_dev->perf_clk_div = rg_gcb_clk_div;
+	gasket_read_modify_write_32(gasket_dev, APEX_BAR_INDEX,
+				    APEX_BAR2_REG_SCU_3,
+				    (rg_axi_clk_fixed << (AXI_CLK_FIXED_SHIFT - 2)) |
+				    (rg_8051_clk_fixed << (MCU_CLK_FIXED_SHIFT - 2)),
+				    /*mask_width=*/2, /*mask_shift=*/30);
+	apex_apply_clk_div(apex_dev);
+	mutex_unlock(&gasket_dev->mutex);
 
 	return 0;
 }
@@ -750,6 +788,24 @@ static ssize_t sysfs_store(struct device *device, struct device_attribute *attr,
 	if (kstrtoint(buf, 10, &value))
 		return -EINVAL;
 
+	/* Temperatures in millidegrees C; anything else is not a sensor value. */
+	switch (gasket_attr_type(attr)) {
+	case ATTR_TEMP_WARN1:
+	case ATTR_TEMP_WARN2:
+	case ATTR_TEMP_TRIP0:
+	case ATTR_TEMP_TRIP1:
+	case ATTR_TEMP_TRIP2:
+		if (value < APEX_TEMP_MIN_MILLIC || value > APEX_TEMP_MAX_MILLIC)
+			return -ERANGE;
+		break;
+	case ATTR_TEMP_POLL_INTERVAL:
+		if (value < 0)
+			return -ERANGE;
+		break;
+	default:
+		break;
+	}
+
 	if (!gasket_dev || !gasket_dev->pci_dev ||
 	    !(apex_dev = pci_get_drvdata(gasket_dev->pci_dev)) ||
 	    !gasket_dev->bar_data[APEX_BAR_INDEX].virt_base)
@@ -784,25 +840,38 @@ static ssize_t sysfs_store(struct device *device, struct device_attribute *attr,
 					    31);
 		apex_dev->hw_temp_warn2_en = !!value;
 		break;
+	/*
+	 * Trip points are compared and updated under the mutex the poller
+	 * holds while it reads them. ADC values fall as temperature rises,
+	 * so they must stay in descending order.
+	 */
 	case ATTR_TEMP_TRIP0:
 		value = millic_to_adc(value);
-		/* Note: that adc values should be in descending order */
-		if (value >= apex_dev->adc_trip_points[1]) {
+		mutex_lock(&gasket_dev->mutex);
+		if (value >= (int)apex_dev->adc_trip_points[1])
 			apex_dev->adc_trip_points[0] = value;
-		} else ret = -EINVAL;
+		else
+			ret = -EINVAL;
+		mutex_unlock(&gasket_dev->mutex);
 		break;
 	case ATTR_TEMP_TRIP1:
 		value = millic_to_adc(value);
-		if (value <= apex_dev->adc_trip_points[0] &&
-		    value >= apex_dev->adc_trip_points[2]) {
+		mutex_lock(&gasket_dev->mutex);
+		if (value <= (int)apex_dev->adc_trip_points[0] &&
+		    value >= (int)apex_dev->adc_trip_points[2])
 			apex_dev->adc_trip_points[1] = value;
-		} else ret = -EINVAL;
+		else
+			ret = -EINVAL;
+		mutex_unlock(&gasket_dev->mutex);
 		break;
 	case ATTR_TEMP_TRIP2:
 		value = millic_to_adc(value);
-		if (value <= apex_dev->adc_trip_points[1]) {
+		mutex_lock(&gasket_dev->mutex);
+		if (value <= (int)apex_dev->adc_trip_points[1])
 			apex_dev->adc_trip_points[2] = value;
-		} else ret = -EINVAL;
+		else
+			ret = -EINVAL;
+		mutex_unlock(&gasket_dev->mutex);
 		break;
 	case ATTR_TEMP_POLL_INTERVAL:
 		cancel_delayed_work_sync(&apex_dev->check_temperature_work);
@@ -927,10 +996,10 @@ static void enable_thermal_sensing(struct gasket_dev *gasket_dev) {
 				    APEX_BAR2_REG_OMC0_DC, 0x1, 1, 0);
 }
 
-static void check_temperature_work_handler(struct work_struct *work) {
+static void check_temperature_work_handler(struct work_struct *work)
+{
 	int i, temp_poll_interval;
-	u32 adc_temp, clk_div, tmp;
-	const u32 mask = ((1 << 2) - 1) << 28;
+	u32 reg, adc_temp, level;
 	struct apex_dev *apex_dev =
 		container_of(work, struct apex_dev,
 			     check_temperature_work.work);
@@ -939,31 +1008,50 @@ static void check_temperature_work_handler(struct work_struct *work) {
 	mutex_lock(&gasket_dev->mutex);
 
 	/* Read current temperature */
-	adc_temp = gasket_dev_read_32(gasket_dev, APEX_BAR_INDEX,
-				      APEX_BAR2_REG_OMC0_DC);
-	adc_temp = (adc_temp >> 16) & ((1 << 10) - 1);
+	reg = gasket_dev_read_32(gasket_dev, APEX_BAR_INDEX,
+				 APEX_BAR2_REG_OMC0_DC);
+	if (reg == U32_MAX) {
+		/* Reads return all ones when the link is down: do not write. */
+		dev_warn_ratelimited(gasket_dev->dev,
+				     "temperature read failed, device not responding\n");
+		goto out;
+	}
+	adc_temp = (reg >> 16) & ((1 << 10) - 1);
 
-	/* Find closest trip point
-	   Note: that adc values are in descending order */
+	/*
+	 * Find the hottest trip point reached. ADC values fall as the
+	 * temperature rises, so trip points are in descending order.
+	 */
 	for (i = ARRAY_SIZE(apex_dev->adc_trip_points) - 1; i >= 0; --i) {
 		if (adc_temp <= apex_dev->adc_trip_points[i])
 			break;
 	}
-	/* Compute divider value and shift into appropriate bit location */
-	clk_div = (i + 1) << 28;
+	level = i + 1;
 
-	/* Modify gcb clk divider if it's different from current one */
-	tmp = gasket_dev_read_32(gasket_dev, APEX_BAR_INDEX,
-				 APEX_BAR2_REG_SCU_3);
-	if (clk_div != (tmp & mask)) {
-		tmp = (tmp & ~mask) | clk_div;
-		gasket_dev_write_32(gasket_dev, tmp, APEX_BAR_INDEX,
-				    APEX_BAR2_REG_SCU_3);
+	/*
+	 * Only lift a throttle once the chip is clearly below the trip point
+	 * that set it, so it does not flip every poll at the boundary.
+	 */
+	if (level < apex_dev->thermal_clk_div &&
+	    adc_temp < apex_dev->adc_trip_points[apex_dev->thermal_clk_div - 1] +
+			       APEX_THERMAL_HYSTERESIS_MILLIC / 250)
+		level = apex_dev->thermal_clk_div;
+
+	if (level != apex_dev->thermal_clk_div) {
+		apex_dev->thermal_clk_div = level;
 		dev_warn(gasket_dev->dev,
 			 "Apex performance %sthrottled due to temperature\n",
-			 i == -1 ? "not " : "");
+			 level ? "" : "not ");
 	}
 
+	/* Also restores the divider after a chip reset cleared it. */
+	reg = gasket_dev_read_32(gasket_dev, APEX_BAR_INDEX,
+				 APEX_BAR2_REG_SCU_3);
+	if (((reg >> 28) & 0x3) !=
+	    max(apex_dev->perf_clk_div, apex_dev->thermal_clk_div))
+		apex_apply_clk_div(apex_dev);
+
+out:
 	mutex_unlock(&gasket_dev->mutex);
 
 	temp_poll_interval = atomic_read(&apex_dev->temp_poll_interval);
@@ -975,6 +1063,11 @@ static void check_temperature_work_handler(struct work_struct *work) {
 /* On device open, perform a core reinit reset. */
 static int apex_device_open_cb(struct gasket_dev *gasket_dev)
 {
+	struct apex_dev *apex_dev = pci_get_drvdata(gasket_dev->pci_dev);
+
+	/* A new owner starts at full speed until it asks otherwise. */
+	if (apex_dev)
+		apex_dev->perf_clk_div = 0;
 	return gasket_reset_nolock(gasket_dev);
 }
 
@@ -1119,6 +1212,9 @@ static int apex_pci_suspend(struct pci_dev *pci_dev, pm_message_t state) {
 		return -ENODEV;
 	}
 
+	/* No register access while the device is powered down. */
+	cancel_delayed_work_sync(&apex_dev->check_temperature_work);
+
 	// Tear down MSI-x interrupts before suspending.
 	gasket_dev = apex_dev->gasket_dev_ptr;
 	gasket_interrupt_msix_cleanup(gasket_dev->interrupt_data);
@@ -1129,6 +1225,7 @@ static int apex_pci_resume(struct pci_dev *pci_dev)
 {
 	struct apex_dev *apex_dev = pci_get_drvdata(pci_dev);
 	struct gasket_dev *gasket_dev;
+	int temp_poll_interval;
 
 	if (!apex_dev) {
 		dev_err_once(&pci_dev->dev, "NULL apex_dev\n");
@@ -1145,6 +1242,10 @@ static int apex_pci_resume(struct pci_dev *pci_dev)
 	if (allow_power_save)
 		apex_enter_reset(gasket_dev);
 
+	temp_poll_interval = atomic_read(&apex_dev->temp_poll_interval);
+	if (temp_poll_interval > 0)
+		schedule_delayed_work(&apex_dev->check_temperature_work,
+				      msecs_to_jiffies(temp_poll_interval));
 	return 0;
 }
 
