@@ -433,6 +433,11 @@ void gasket_interrupt_cleanup(struct gasket_dev *gasket_dev)
 	if (!interrupt_data)
 		return;
 
+	/* Readers of interrupt_data (sysfs) take the device mutex. */
+	mutex_lock(&gasket_dev->mutex);
+	gasket_dev->interrupt_data = NULL;
+	mutex_unlock(&gasket_dev->mutex);
+
 	switch (interrupt_data->type) {
 	case PCI_MSIX:
 		gasket_interrupt_msix_cleanup(interrupt_data);
@@ -448,7 +453,6 @@ void gasket_interrupt_cleanup(struct gasket_dev *gasket_dev)
 	kfree(interrupt_data->interrupt_counts);
 	kfree(interrupt_data->eventfd_ctxs);
 	kfree(interrupt_data);
-	gasket_dev->interrupt_data = NULL;
 }
 
 int gasket_interrupt_system_status(struct gasket_dev *gasket_dev)

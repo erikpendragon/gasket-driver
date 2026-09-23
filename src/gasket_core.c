@@ -60,6 +60,14 @@ struct gasket_internal_desc {
 	const struct attribute_group *groups[3];
 };
 
+static void gasket_dev_release(struct device *dev);
+
+/* One open file of a Gasket device (see gasket_dev.open_files). */
+struct gasket_open_file {
+	struct list_head node;
+	struct file *filp;
+};
+
 /* do_map_region() needs be able to return more than just true/false. */
 enum do_map_region_status {
 	/* The region was successfully mapped. */
@@ -202,7 +210,7 @@ static int gasket_find_dev_slot(struct gasket_internal_desc *internal_desc,
 static int gasket_alloc_dev(struct gasket_internal_desc *internal_desc,
 			    struct device *parent, struct gasket_dev **pdev)
 {
-	int dev_idx;
+	int dev_idx, ret;
 	const struct gasket_driver_desc *driver_desc =
 		internal_desc->driver_desc;
 	struct gasket_dev *gasket_dev;
@@ -217,14 +225,15 @@ static int gasket_alloc_dev(struct gasket_internal_desc *internal_desc,
 	if (dev_idx < 0)
 		return dev_idx;
 
-	gasket_dev = *pdev = kzalloc(sizeof(*gasket_dev), GFP_KERNEL);
+	gasket_dev = kzalloc(sizeof(*gasket_dev), GFP_KERNEL);
 	if (!gasket_dev) {
 		pr_err("no memory for device, parent %s\n", parent_name);
 		return -ENOMEM;
 	}
-	internal_desc->devs[dev_idx] = gasket_dev;
 
 	mutex_init(&gasket_dev->mutex);
+	init_rwsem(&gasket_dev->state_sem);
+	INIT_LIST_HEAD(&gasket_dev->open_files);
 
 	gasket_dev->internal_desc = internal_desc;
 	gasket_dev->dev_idx = dev_idx;
@@ -243,20 +252,53 @@ static int gasket_alloc_dev(struct gasket_internal_desc *internal_desc,
 	dev_info->devt =
 		MKDEV(driver_desc->major, driver_desc->minor +
 		      gasket_dev->dev_idx);
-	dev_info->device =
-		device_create_with_groups(internal_desc->class, parent,
-					  dev_info->devt, gasket_dev,
-					  internal_desc->groups, "%s",
-					  dev_info->name);
+	dev_info->gasket_dev_ptr = gasket_dev;
+
+	/* From here on, put_device(&class_dev) frees gasket_dev. */
+	device_initialize(&gasket_dev->class_dev);
+	gasket_dev->class_dev.class = internal_desc->class;
+	gasket_dev->class_dev.parent = parent;
+	gasket_dev->class_dev.devt = dev_info->devt;
+	gasket_dev->class_dev.groups = internal_desc->groups;
+	gasket_dev->class_dev.release = gasket_dev_release;
+	dev_set_drvdata(&gasket_dev->class_dev, gasket_dev);
+	ret = dev_set_name(&gasket_dev->class_dev, "%s", dev_info->name);
+	if (!ret)
+		ret = device_add(&gasket_dev->class_dev);
+	if (ret) {
+		dev_err(parent, "cannot create %s device %s [ret = %d]\n",
+			driver_desc->name, dev_info->name, ret);
+		put_device(&gasket_dev->class_dev);
+		return ret;
+	}
+	dev_info->device = &gasket_dev->class_dev;
+
+	mutex_lock(&internal_desc->mutex);
+	internal_desc->devs[dev_idx] = gasket_dev;
+	mutex_unlock(&internal_desc->mutex);
+	*pdev = gasket_dev;
 
 	/* cdev has not yet been added; cdev_added is 0 */
-	dev_info->gasket_dev_ptr = gasket_dev;
 	/* ownership is all 0, indicating no owner or opens. */
 
 	return 0;
 }
 
-/* Free a Gasket device. */
+/*
+ * Release of the class device: the last reference is gone, which means the
+ * device was removed and every file that had it open has been closed.
+ */
+static void gasket_dev_release(struct device *dev)
+{
+	struct gasket_dev *gasket_dev =
+		container_of(dev, struct gasket_dev, class_dev);
+
+	put_device(gasket_dev->dev);
+	put_device(gasket_dev->dma_dev);
+	kfree(gasket_dev);
+}
+
+/* Drop a Gasket device from the driver's table and release our reference. */
 static void gasket_free_dev(struct gasket_dev *gasket_dev)
 {
 	struct gasket_internal_desc *internal_desc = gasket_dev->internal_desc;
@@ -264,9 +306,9 @@ static void gasket_free_dev(struct gasket_dev *gasket_dev)
 	mutex_lock(&internal_desc->mutex);
 	internal_desc->devs[gasket_dev->dev_idx] = NULL;
 	mutex_unlock(&internal_desc->mutex);
-	put_device(gasket_dev->dev);
-	put_device(gasket_dev->dma_dev);
-	kfree(gasket_dev);
+	if (device_is_registered(&gasket_dev->class_dev))
+		device_del(&gasket_dev->class_dev);
+	put_device(&gasket_dev->class_dev);
 }
 
 /*
@@ -554,7 +596,9 @@ static ssize_t gasket_sysfs_data_show(struct device *device,
 							     driver_desc, i);
 		break;
 	case ATTR_INTERRUPT_COUNTS:
+		mutex_lock(&gasket_dev->mutex);
 		ret = gasket_interrupt_counts_show(gasket_dev, buf);
+		mutex_unlock(&gasket_dev->mutex);
 		break;
 	default:
 		ret = -EINVAL;
@@ -618,6 +662,9 @@ static int gasket_add_cdev(struct gasket_cdev_info *dev_info,
 
 	cdev_init(&dev_info->cdev, file_ops);
 	dev_info->cdev.owner = owner;
+	/* Open files keep the class device, and so gasket_dev, alive. */
+	cdev_set_parent(&dev_info->cdev,
+			&dev_info->gasket_dev_ptr->class_dev.kobj);
 	ret = cdev_add(&dev_info->cdev, dev_info->devt, 1);
 	if (ret) {
 		dev_err(dev_info->gasket_dev_ptr->dev,
@@ -636,10 +683,26 @@ void gasket_disable_device(struct gasket_dev *gasket_dev)
 		gasket_dev->internal_desc->driver_desc;
 	int i;
 
+	struct gasket_open_file *of;
+
 	dev_dbg(gasket_dev->dev, "disabling device\n");
-	/* Only delete the device if it has been successfully added. */
+
+	/* Wait for running file operations, then refuse new ones. */
+	down_write(&gasket_dev->state_sem);
+	WRITE_ONCE(gasket_dev->gone, true);
+	up_write(&gasket_dev->state_sem);
+
+	/* Remove sysfs (waits for active readers) and the device node. */
+	if (device_is_registered(&gasket_dev->class_dev))
+		device_del(&gasket_dev->class_dev);
 	if (gasket_dev->dev_info.cdev_added)
 		cdev_del(&gasket_dev->dev_info.cdev);
+
+	/* User mappings of the BAR and coherent buffer must not outlive it. */
+	mutex_lock(&gasket_dev->mutex);
+	list_for_each_entry(of, &gasket_dev->open_files, node)
+		unmap_mapping_range(of->filp->f_mapping, 0, 0, 1);
+	mutex_unlock(&gasket_dev->mutex);
 
 	gasket_dev->status = GASKET_STATUS_DEAD;
 
@@ -648,7 +711,9 @@ void gasket_disable_device(struct gasket_dev *gasket_dev)
 	for (i = 0; i < driver_desc->num_page_tables; ++i) {
 		if (gasket_dev->page_table[i]) {
 			gasket_page_table_reset(gasket_dev->page_table[i]);
+			gasket_free_coherent_memory_all(gasket_dev, i);
 			gasket_page_table_cleanup(gasket_dev->page_table[i]);
+			gasket_dev->page_table[i] = NULL;
 		}
 	}
 }
@@ -1035,8 +1100,8 @@ static int gasket_mmap_coherent(struct gasket_dev *gasket_dev,
 	return 0;
 }
 
-/* Map a device's BARs into user space. */
-static int gasket_mmap(struct file *filp, struct vm_area_struct *vma)
+/* Map a device's BARs into user space. Called with gasket_dev->mutex held. */
+static int __gasket_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	int i, ret;
 	int bar_index;
@@ -1202,6 +1267,8 @@ static int gasket_open(struct inode *inode, struct file *filp)
 	struct pid_namespace *pid_ns = task_active_pid_ns(current);
 	bool is_root = ns_capable(pid_ns->user_ns, CAP_SYS_ADMIN);
 
+	struct gasket_open_file *of;
+
 	gasket_dev = dev_info->gasket_dev_ptr;
 	driver_desc = gasket_dev->internal_desc->driver_desc;
 	ownership = &dev_info->ownership;
@@ -1215,13 +1282,27 @@ static int gasket_open(struct inode *inode, struct file *filp)
 		current->tgid, task_name, filp->f_mode,
 		(filp->f_mode & FMODE_WRITE), is_root);
 
-	/* Always allow non-writing accesses. */
-	if (!(filp->f_mode & FMODE_WRITE)) {
-		dev_dbg(gasket_dev->dev, "Allowing read-only opening.\n");
-		return 0;
+	of = kzalloc(sizeof(*of), GFP_KERNEL);
+	if (!of)
+		return -ENOMEM;
+	of->filp = filp;
+
+	ret = gasket_dev_enter(gasket_dev);
+	if (ret) {
+		kfree(of);
+		return ret;
 	}
 
 	mutex_lock(&gasket_dev->mutex);
+
+	/* Always allow non-writing accesses. */
+	if (!(filp->f_mode & FMODE_WRITE)) {
+		dev_dbg(gasket_dev->dev, "Allowing read-only opening.\n");
+		list_add(&of->node, &gasket_dev->open_files);
+		mutex_unlock(&gasket_dev->mutex);
+		gasket_dev_exit(gasket_dev);
+		return 0;
+	}
 
 	dev_dbg(gasket_dev->dev,
 		"Current owner open count (owning tgid %u): %d.\n",
@@ -1234,6 +1315,8 @@ static int gasket_open(struct inode *inode, struct file *filp)
 			"Process %u is opening a node held by %u.\n",
 			current->tgid, ownership->owner);
 		mutex_unlock(&gasket_dev->mutex);
+		gasket_dev_exit(gasket_dev);
+		kfree(of);
 		return -EPERM;
 	}
 
@@ -1245,6 +1328,8 @@ static int gasket_open(struct inode *inode, struct file *filp)
 			dev_err(gasket_dev->dev,
 				"Error in device open cb: %d\n", ret);
 			mutex_unlock(&gasket_dev->mutex);
+			gasket_dev_exit(gasket_dev);
+			kfree(of);
 			return ret;
 		}
 		ownership->is_owned = 1;
@@ -1254,11 +1339,13 @@ static int gasket_open(struct inode *inode, struct file *filp)
 	}
 
 	ownership->write_open_count++;
+	list_add(&of->node, &gasket_dev->open_files);
 
 	dev_dbg(gasket_dev->dev, "New open count (owning tgid %u): %d\n",
 		ownership->owner, ownership->write_open_count);
 
 	mutex_unlock(&gasket_dev->mutex);
+	gasket_dev_exit(gasket_dev);
 	return 0;
 }
 
@@ -1281,11 +1368,30 @@ static int gasket_release(struct inode *inode, struct file *file)
 	struct pid_namespace *pid_ns = task_active_pid_ns(current);
 	bool is_root = ns_capable(pid_ns->user_ns, CAP_SYS_ADMIN);
 
+	struct gasket_open_file *of, *tmp;
+	bool present;
+
 	gasket_dev = dev_info->gasket_dev_ptr;
 	driver_desc = gasket_dev->internal_desc->driver_desc;
 	ownership = &dev_info->ownership;
 	get_task_comm(task_name, current);
+
+	/*
+	 * Keep removal out while the hardware is torn down below. After
+	 * removal only the bookkeeping is done: removal already reset the
+	 * chip and released every mapping.
+	 */
+	down_read(&gasket_dev->state_sem);
+	present = !gasket_dev->gone;
 	mutex_lock(&gasket_dev->mutex);
+
+	list_for_each_entry_safe(of, tmp, &gasket_dev->open_files, node) {
+		if (of->filp == file) {
+			list_del(&of->node);
+			kfree(of);
+			break;
+		}
+	}
 
 	dev_dbg(gasket_dev->dev,
 		"Releasing device node. Call origin: tgid %u (%s) "
@@ -1301,6 +1407,8 @@ static int gasket_release(struct inode *inode, struct file *file)
 			dev_dbg(gasket_dev->dev, "Device is now free\n");
 			ownership->is_owned = 0;
 			ownership->owner = 0;
+		}
+		if (ownership->write_open_count == 0 && present) {
 
 			/* Forces chip reset before we unmap the page tables. */
 			driver_desc->device_reset_cb(gasket_dev);
@@ -1320,6 +1428,7 @@ static int gasket_release(struct inode *inode, struct file *file)
 	dev_dbg(gasket_dev->dev, "New open count (owning tgid %u): %d\n",
 		ownership->owner, ownership->write_open_count);
 	mutex_unlock(&gasket_dev->mutex);
+	up_read(&gasket_dev->state_sem);
 	return 0;
 }
 
@@ -1336,6 +1445,7 @@ static long gasket_ioctl(struct file *filp, uint cmd, ulong arg)
 	const struct gasket_driver_desc *driver_desc;
 	void __user *argp = (void __user *)arg;
 	char path[256];
+	long ret;
 
 	gasket_dev = (struct gasket_dev *)filp->private_data;
 	driver_desc = gasket_dev->internal_desc->driver_desc;
@@ -1346,20 +1456,53 @@ static long gasket_ioctl(struct file *filp, uint cmd, ulong arg)
 		return -ENODEV;
 	}
 
+	ret = gasket_dev_enter(gasket_dev);
+	if (ret)
+		return ret;
+
 	if (!gasket_is_supported_ioctl(cmd)) {
 		/*
 		 * The ioctl handler is not a standard Gasket callback, since
 		 * it requires different arguments. This means we can't use
 		 * check_and_invoke_callback.
 		 */
-		if (driver_desc->ioctl_handler_cb)
-			return driver_desc->ioctl_handler_cb(filp, cmd, argp);
-
-		dev_dbg(gasket_dev->dev, "Received unknown ioctl 0x%x\n", cmd);
-		return -EINVAL;
+		if (driver_desc->ioctl_handler_cb) {
+			ret = driver_desc->ioctl_handler_cb(filp, cmd, argp);
+		} else {
+			dev_dbg(gasket_dev->dev,
+				"Received unknown ioctl 0x%x\n", cmd);
+			ret = -EINVAL;
+		}
+	} else {
+		ret = gasket_handle_ioctl(filp, cmd, argp);
 	}
 
-	return gasket_handle_ioctl(filp, cmd, argp);
+	gasket_dev_exit(gasket_dev);
+	return ret;
+}
+
+/*
+ * mmap() entry point.
+ *
+ * This runs with the caller's mmap_lock held, so it must not wait on
+ * state_sem (an ioctl holding state_sem may be waiting for that same
+ * mmap_lock while removal waits to take state_sem for writing). Removal
+ * sets "gone" first and then unmaps every user mapping under the device
+ * mutex, so checking "gone" under the mutex here is enough: a mapping made
+ * before removal is unmapped by it, and none is made after.
+ */
+static int gasket_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct gasket_dev *gasket_dev = filp->private_data;
+	int ret;
+
+	mutex_lock(&gasket_dev->mutex);
+	if (READ_ONCE(gasket_dev->gone))
+		ret = -ENODEV;
+	else
+		ret = __gasket_mmap(filp, vma);
+	mutex_unlock(&gasket_dev->mutex);
+	return ret;
 }
 
 /* File operations for all Gasket devices. */
@@ -1385,8 +1528,7 @@ int gasket_enable_device(struct gasket_dev *gasket_dev)
 	if (ret) {
 		dev_err(gasket_dev->dev,
 			"Critical failure to allocate interrupts: %d\n", ret);
-		gasket_interrupt_cleanup(gasket_dev);
-		return ret;
+		goto undo;
 	}
 
 	for (tbl_idx = 0; tbl_idx < driver_desc->num_page_tables; tbl_idx++) {
@@ -1401,7 +1543,7 @@ int gasket_enable_device(struct gasket_dev *gasket_dev)
 			dev_err(gasket_dev->dev,
 				"Couldn't init page table %d: %d\n",
 				tbl_idx, ret);
-			return ret;
+			goto undo;
 		}
 		/*
 		 * Make sure that the page table is clear and set to simple
@@ -1419,7 +1561,7 @@ int gasket_enable_device(struct gasket_dev *gasket_dev)
 	if (ret < 0) {
 		dev_err(gasket_dev->dev,
 			"Error getting hardware revision: %d\n", ret);
-		return ret;
+		goto undo;
 	}
 	gasket_dev->hardware_revision = ret;
 
@@ -1431,9 +1573,25 @@ int gasket_enable_device(struct gasket_dev *gasket_dev)
 	ret = gasket_add_cdev(&gasket_dev->dev_info, &gasket_file_ops,
 			      driver_desc->module);
 	if (ret)
-		return ret;
+		goto undo;
 
 	return 0;
+
+undo:
+	/* Give back what was set up, so the caller can simply remove. */
+	gasket_interrupt_cleanup(gasket_dev);
+	for (tbl_idx = 0; tbl_idx < driver_desc->num_page_tables; tbl_idx++) {
+		struct gasket_page_table *pg_tbl;
+
+		/* sysfs readers of page_table[] take the device mutex. */
+		mutex_lock(&gasket_dev->mutex);
+		pg_tbl = gasket_dev->page_table[tbl_idx];
+		gasket_dev->page_table[tbl_idx] = NULL;
+		mutex_unlock(&gasket_dev->mutex);
+		if (pg_tbl)
+			gasket_page_table_cleanup(pg_tbl);
+	}
+	return ret;
 }
 EXPORT_SYMBOL(gasket_enable_device);
 
@@ -1443,32 +1601,18 @@ static int __gasket_add_device(struct device *parent_dev,
 {
 	int ret;
 	struct gasket_dev *gasket_dev;
-	const struct gasket_driver_desc *driver_desc =
-	    internal_desc->driver_desc;
 
 	ret = gasket_alloc_dev(internal_desc, parent_dev, &gasket_dev);
 	if (ret)
 		return ret;
-	if (IS_ERR(gasket_dev->dev_info.device)) {
-		dev_err(parent_dev, "Cannot create %s device %s [ret = %ld]\n",
-			driver_desc->name, gasket_dev->dev_info.name,
-			PTR_ERR(gasket_dev->dev_info.device));
-		ret = -ENODEV;
-		goto free_gasket_dev;
-	}
 
 	*gasket_devp = gasket_dev;
 	return 0;
-
-free_gasket_dev:
-	gasket_free_dev(gasket_dev);
-	return ret;
 }
 
 static void __gasket_remove_device(struct gasket_internal_desc *internal_desc,
 				   struct gasket_dev *gasket_dev)
 {
-	device_destroy(internal_desc->class, gasket_dev->dev_info.devt);
 	gasket_free_dev(gasket_dev);
 }
 

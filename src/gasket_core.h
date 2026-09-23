@@ -14,6 +14,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/rwsem.h>
 #include <linux/platform_device.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -336,7 +337,44 @@ struct gasket_dev {
 	/* Unused until Accel is upstreamed. */
 	struct hlist_node hlist_node;
 	struct hlist_node legacy_hlist_node;
+
+	/*
+	 * Class device (/sys/class/<driver>/<name>_N). Its release frees this
+	 * structure, and the cdev holds a reference to it, so the structure
+	 * outlives every open file even after the hardware is removed.
+	 */
+	struct device class_dev;
+
+	/*
+	 * Set once, under state_sem held for writing, when the hardware is
+	 * being removed. File operations hold state_sem for reading while they
+	 * run (see gasket_dev_enter()), so teardown never races with them.
+	 */
+	struct rw_semaphore state_sem;
+	bool gone;
+
+	/* Open files, for unmapping user mappings on removal. Under mutex. */
+	struct list_head open_files;
 };
+
+/*
+ * Start a file operation on a device. Returns 0 with state_sem held for
+ * reading, or -ENODEV if the device has been removed.
+ */
+static inline int gasket_dev_enter(struct gasket_dev *gasket_dev)
+{
+	down_read(&gasket_dev->state_sem);
+	if (gasket_dev->gone) {
+		up_read(&gasket_dev->state_sem);
+		return -ENODEV;
+	}
+	return 0;
+}
+
+static inline void gasket_dev_exit(struct gasket_dev *gasket_dev)
+{
+	up_read(&gasket_dev->state_sem);
+}
 
 /* Type of the ioctl handler callback. */
 typedef long (*gasket_ioctl_handler_cb_t)(struct file *file, uint cmd,

@@ -647,12 +647,20 @@ static ssize_t sysfs_show(struct device *device, struct device_attribute *attr,
 	struct gasket_dev *gasket_dev = dev_get_drvdata(device);
 	struct apex_dev *apex_dev;
 
-	/* Until probe has finished there is no apex_dev and no BAR mapping. */
-	if (!gasket_dev || !gasket_dev->pci_dev ||
-	    !(apex_dev = pci_get_drvdata(gasket_dev->pci_dev)) ||
-	    !gasket_dev->page_table[0] ||
-	    !gasket_dev->bar_data[APEX_BAR_INDEX].virt_base)
+	if (!gasket_dev || !gasket_dev->pci_dev)
 		return -ENODEV;
+
+	/*
+	 * The mutex keeps a failed probe from freeing page_table[] under us.
+	 * Until probe has finished there is no apex_dev and no page table.
+	 */
+	mutex_lock(&gasket_dev->mutex);
+	apex_dev = pci_get_drvdata(gasket_dev->pci_dev);
+	if (!apex_dev || !gasket_dev->page_table[0] ||
+	    !gasket_dev->bar_data[APEX_BAR_INDEX].virt_base) {
+		mutex_unlock(&gasket_dev->mutex);
+		return -ENODEV;
+	}
 
 	switch (gasket_attr_type(attr)) {
 	case ATTR_KERNEL_HIB_PAGE_TABLE_SIZE:
@@ -726,6 +734,7 @@ static ssize_t sysfs_show(struct device *device, struct device_attribute *attr,
 		break;
 	}
 
+	mutex_unlock(&gasket_dev->mutex);
 	return ret;
 }
 
@@ -1068,6 +1077,7 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 	return 0;
 
 remove_device:
+	pci_set_drvdata(pci_dev, NULL);
 	gasket_pci_remove_device(pci_dev);
 	pci_disable_device(pci_dev);
 	kfree(apex_dev);
@@ -1085,10 +1095,16 @@ static void apex_pci_remove(struct pci_dev *pci_dev)
 	}
 	gasket_dev = apex_dev->gasket_dev_ptr;
 
-	cancel_delayed_work_sync(&apex_dev->check_temperature_work);
-	kfree(apex_dev);
-
+	/*
+	 * Disable first: it removes sysfs (so nothing can re-arm the
+	 * temperature poller), blocks file operations and unmaps user
+	 * mappings. The BARs stay mapped until gasket_pci_remove_device(), so
+	 * a poll that is still running can finish safely.
+	 */
 	gasket_disable_device(gasket_dev);
+	cancel_delayed_work_sync(&apex_dev->check_temperature_work);
+	pci_set_drvdata(pci_dev, NULL);
+	kfree(apex_dev);
 remove_device:
 	gasket_pci_remove_device(pci_dev);
 	pci_disable_device(pci_dev);
