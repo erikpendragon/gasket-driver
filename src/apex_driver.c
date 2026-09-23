@@ -679,7 +679,7 @@ static ssize_t sysfs_show(struct device *device, struct device_attribute *attr,
 		break;
 	case ATTR_KERNEL_HIB_SIMPLE_PAGE_TABLE_SIZE:
 		ret = scnprintf(buf, PAGE_SIZE, "%u\n",
-				gasket_page_table_num_entries(
+				gasket_page_table_num_simple_entries(
 					gasket_dev->page_table[0]));
 		break;
 	case ATTR_KERNEL_HIB_NUM_ACTIVE_PAGES:
@@ -939,7 +939,7 @@ static void enable_thermal_sensing(struct gasket_dev *gasket_dev) {
 
 	// Enable OMC thermal sensor controller
 	// This bit should be asserted 100 us after ENAD ENVR ENBG
-	schedule_timeout(usecs_to_jiffies(100));
+	fsleep(100);
 	gasket_read_modify_write_32(gasket_dev, APEX_BAR_INDEX,
 				    APEX_BAR2_REG_OMC0_DC, 0x1, 1, 0);
 }
@@ -1061,7 +1061,7 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 					   APEX_BAR2_REG_KERNEL_HIB_MSIX_TABLE_INIT);
 		if (page_table_ready && msix_table_ready)
 			break;
-		schedule_timeout(msecs_to_jiffies(APEX_RESET_DELAY));
+		msleep(APEX_RESET_DELAY);
 		retries++;
 	}
 

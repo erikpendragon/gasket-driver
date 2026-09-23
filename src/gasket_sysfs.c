@@ -317,6 +317,7 @@ gasket_sysfs_get_attr(struct device *device, struct device_attribute *attr)
 
 	dev_err(device, "Unable to find match for device_attribute %s\n",
 		attr->attr.name);
+	put_mapping(mapping);
 	return NULL;
 }
 EXPORT_SYMBOL(gasket_sysfs_get_attr);
@@ -343,6 +344,7 @@ void gasket_sysfs_put_attr(struct device *device,
 
 	dev_err(device, "Unable to put unknown attribute: %s\n",
 		attr->attr.attr.name);
+	put_mapping(mapping);
 }
 EXPORT_SYMBOL(gasket_sysfs_put_attr);
 
@@ -370,19 +372,20 @@ ssize_t gasket_sysfs_register_store(struct device *device,
 	mapping = get_mapping(device);
 	if (!mapping) {
 		dev_err(device, "Device driver may have been removed\n");
-		return 0;
+		return -ENODEV;
 	}
 
 	gasket_dev = mapping->gasket_dev;
 	if (!gasket_dev) {
 		dev_err(device, "Device driver may have been removed\n");
-		return 0;
+		put_mapping(mapping);
+		return -ENODEV;
 	}
 
 	gasket_attr = gasket_sysfs_get_attr(device, attr);
 	if (!gasket_attr) {
 		put_mapping(mapping);
-		return count;
+		return -EINVAL;
 	}
 
 	gasket_dev_write_64(gasket_dev, parsed_value,
