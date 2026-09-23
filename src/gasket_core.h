@@ -355,6 +355,13 @@ struct gasket_dev {
 
 	/* Open files, for unmapping user mappings on removal. Under mutex. */
 	struct list_head open_files;
+
+	/*
+	 * User mappings of the coherent buffer, and whether the owner's last
+	 * close asked to free it while such mappings remained. Under mutex.
+	 */
+	int coherent_mmap_count;
+	bool coherent_free_pending;
 };
 
 /*

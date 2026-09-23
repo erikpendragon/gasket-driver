@@ -1537,10 +1537,12 @@ int gasket_set_user_virt(
 			__func__);
 		return 0;
 	}
-	for (j = 0; j < num_pages; j++) {
+	mutex_lock(&pg_tbl->mutex);
+	for (j = 0; j < num_pages && j < pg_tbl->num_coherent_pages; j++) {
 		pg_tbl->coherent_pages[j].user_virt =
 			(u64)vma + j * PAGE_SIZE;
 	}
+	mutex_unlock(&pg_tbl->mutex);
 	return 0;
 }
 
@@ -1554,25 +1556,31 @@ int gasket_alloc_coherent_memory(struct gasket_dev *gasket_dev, u64 size,
 	unsigned int num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
 	const struct gasket_driver_desc *driver_desc =
 		gasket_get_driver_desc(gasket_dev);
+	struct gasket_page_table *pg_tbl = gasket_dev->page_table[index];
+	struct gasket_coherent_page_entry *coherent_pages;
 
-	if (!gasket_dev->page_table[index])
+	lockdep_assert_held(&gasket_dev->mutex);
+
+	if (!pg_tbl)
 		return -EFAULT;
 
 	if (num_pages == 0)
 		return -EINVAL;
+
+	/* One buffer per device: a second allocate used to leak the first. */
+	if (gasket_dev->coherent_buffer.length_bytes || pg_tbl->coherent_pages)
+		return -EBUSY;
 
 	mem = dma_alloc_coherent(gasket_get_device(gasket_dev),
 				 num_pages * PAGE_SIZE, &handle, GFP_KERNEL);
 	if (!mem)
 		goto nomem;
 
-	gasket_dev->page_table[index]->num_coherent_pages = num_pages;
-
 	/* allocate the physical memory block */
-	gasket_dev->page_table[index]->coherent_pages =
-		kcalloc(num_pages, sizeof(struct gasket_coherent_page_entry),
-			GFP_KERNEL);
-	if (!gasket_dev->page_table[index]->coherent_pages)
+	coherent_pages = kcalloc(num_pages,
+				 sizeof(struct gasket_coherent_page_entry),
+				 GFP_KERNEL);
+	if (!coherent_pages)
 		goto nomem;
 
 	gasket_dev->coherent_buffer.length_bytes =
@@ -1582,11 +1590,15 @@ int gasket_alloc_coherent_memory(struct gasket_dev *gasket_dev, u64 size,
 
 	*dma_address = driver_desc->coherent_buffer_description.base;
 	for (j = 0; j < num_pages; j++) {
-		gasket_dev->page_table[index]->coherent_pages[j].paddr =
-			handle + j * PAGE_SIZE;
-		gasket_dev->page_table[index]->coherent_pages[j].kernel_virt =
-			(ulong)mem + j * PAGE_SIZE;
+		coherent_pages[j].paddr = handle + j * PAGE_SIZE;
+		coherent_pages[j].kernel_virt = (ulong)mem + j * PAGE_SIZE;
 	}
+
+	/* The map path reads these under the page table mutex. */
+	mutex_lock(&pg_tbl->mutex);
+	pg_tbl->coherent_pages = coherent_pages;
+	pg_tbl->num_coherent_pages = num_pages;
+	mutex_unlock(&pg_tbl->mutex);
 
 	return 0;
 
@@ -1598,10 +1610,6 @@ nomem:
 		gasket_dev->coherent_buffer.virt_base = NULL;
 		gasket_dev->coherent_buffer.phys_base = 0;
 	}
-
-	kfree(gasket_dev->page_table[index]->coherent_pages);
-	gasket_dev->page_table[index]->coherent_pages = NULL;
-	gasket_dev->page_table[index]->num_coherent_pages = 0;
 	return -ENOMEM;
 }
 
@@ -1611,6 +1619,8 @@ int gasket_free_coherent_memory(struct gasket_dev *gasket_dev, u64 size,
 {
 	const struct gasket_driver_desc *driver_desc;
 
+	lockdep_assert_held(&gasket_dev->mutex);
+
 	if (!gasket_dev->page_table[index])
 		return -EFAULT;
 
@@ -1618,6 +1628,10 @@ int gasket_free_coherent_memory(struct gasket_dev *gasket_dev, u64 size,
 
 	if (driver_desc->coherent_buffer_description.base != dma_address)
 		return -EADDRNOTAVAIL;
+
+	/* Freeing memory a process still has mapped would hand it to others. */
+	if (gasket_dev->coherent_mmap_count)
+		return -EBUSY;
 
 	gasket_free_coherent_memory_all(gasket_dev, index);
 
@@ -1641,7 +1655,9 @@ void gasket_free_coherent_memory_all(
 		gasket_dev->coherent_buffer.phys_base = 0;
 	}
 
+	mutex_lock(&gasket_dev->page_table[index]->mutex);
 	kfree(gasket_dev->page_table[index]->coherent_pages);
 	gasket_dev->page_table[index]->coherent_pages = NULL;
 	gasket_dev->page_table[index]->num_coherent_pages = 0;
+	mutex_unlock(&gasket_dev->page_table[index]->mutex);
 }

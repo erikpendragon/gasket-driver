@@ -269,6 +269,7 @@ static int gasket_config_coherent_allocator(
 	if (ibuf.size > PAGE_SIZE * MAX_NUM_COHERENT_PAGES)
 		return -ENOMEM;
 
+	mutex_lock(&gasket_dev->mutex);
 	if (ibuf.enable == 0) {
 		dma_address = ibuf.dma_address;
 		ret = gasket_free_coherent_memory(gasket_dev, ibuf.size,
@@ -279,6 +280,7 @@ static int gasket_config_coherent_allocator(
 						   &dma_address,
 						   ibuf.page_table_index);
 	}
+	mutex_unlock(&gasket_dev->mutex);
 	if (ret)
 		return ret;
 
