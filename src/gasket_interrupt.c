@@ -481,6 +481,27 @@ int gasket_interrupt_set_eventfd(struct gasket_interrupt_data *interrupt_data,
 	return 0;
 }
 
+/*
+ * Signal every registered eventfd once. Used on removal: a process blocked
+ * waiting for a completion interrupt that will now never come wakes up, finds
+ * the device gone, and can exit instead of hanging.
+ */
+void gasket_interrupt_wake_all(struct gasket_dev *gasket_dev)
+{
+	struct gasket_interrupt_data *interrupt_data = gasket_dev->interrupt_data;
+	ulong flags;
+	int i;
+
+	if (!interrupt_data)
+		return;
+
+	read_lock_irqsave(&interrupt_data->eventfd_ctx_lock, flags);
+	for (i = 0; i < interrupt_data->num_interrupts; i++)
+		if (interrupt_data->eventfd_ctxs[i])
+			eventfd_signal(interrupt_data->eventfd_ctxs[i]);
+	read_unlock_irqrestore(&interrupt_data->eventfd_ctx_lock, flags);
+}
+
 int gasket_interrupt_clear_eventfd(struct gasket_interrupt_data *interrupt_data,
 				   int interrupt)
 {

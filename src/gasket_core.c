@@ -725,6 +725,12 @@ void gasket_disable_device(struct gasket_dev *gasket_dev)
 
 	gasket_dev->status = GASKET_STATUS_DEAD;
 
+	/*
+	 * Wake anyone blocked on a completion interrupt: with the mappings
+	 * gone they get SIGBUS on the next register access instead of waiting
+	 * forever (found by the VM remove-during-inference test).
+	 */
+	gasket_interrupt_wake_all(gasket_dev);
 	gasket_interrupt_cleanup(gasket_dev);
 
 	/*
