@@ -17,6 +17,7 @@
 #include "gasket_page_table.h"
 
 #include <linux/capability.h>
+#include <linux/compat.h>
 #include <linux/compiler.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -323,7 +324,7 @@ static int gasket_map_pci_bar(struct gasket_dev *gasket_dev, int bar_num)
 	const struct gasket_driver_desc *driver_desc =
 		internal_desc->driver_desc;
 	ulong desc_bytes = driver_desc->bar_descriptions[bar_num].size;
-	int ret;
+	void __iomem *virt_base;
 
 	if (desc_bytes == 0)
 		return 0;
@@ -355,37 +356,22 @@ static int gasket_map_pci_bar(struct gasket_dev *gasket_dev, int bar_num)
 		return -ENOMEM;
 	}
 
-	if (!request_mem_region(gasket_dev->bar_data[bar_num].phys_base,
-				gasket_dev->bar_data[bar_num].length_bytes,
-				gasket_dev->dev_info.name)) {
+	/*
+	 * Request and map the BAR as a managed resource: it stays mapped
+	 * until the driver is unbound, after remove() has stopped every user.
+	 */
+	virt_base = pcim_iomap_region(gasket_dev->pci_dev, bar_num,
+				      gasket_dev->dev_info.name);
+	if (IS_ERR(virt_base)) {
 		dev_err(gasket_dev->dev,
-			"Cannot get BAR %d memory region %p\n",
-			bar_num, &gasket_dev->pci_dev->resource[bar_num]);
-		return -EINVAL;
+			"Cannot map BAR %d memory region %pR [ret=%ld]\n",
+			bar_num, &gasket_dev->pci_dev->resource[bar_num],
+			PTR_ERR(virt_base));
+		return PTR_ERR(virt_base);
 	}
-
-	gasket_dev->bar_data[bar_num].virt_base =
-		ioremap(gasket_dev->bar_data[bar_num].phys_base,
-			gasket_dev->bar_data[bar_num].length_bytes);
-	if (!gasket_dev->bar_data[bar_num].virt_base) {
-		dev_err(gasket_dev->dev,
-			"Cannot remap BAR %d memory region %p\n",
-			bar_num, &gasket_dev->pci_dev->resource[bar_num]);
-		ret = -ENOMEM;
-		goto fail;
-	}
-
-	dma_set_mask(&gasket_dev->pci_dev->dev, DMA_BIT_MASK(dma_bit_mask));
-	dma_set_coherent_mask(&gasket_dev->pci_dev->dev,
-			      DMA_BIT_MASK(dma_bit_mask));
+	gasket_dev->bar_data[bar_num].virt_base = virt_base;
 
 	return 0;
-
-fail:
-	iounmap(gasket_dev->bar_data[bar_num].virt_base);
-	release_mem_region(gasket_dev->bar_data[bar_num].phys_base,
-			   gasket_dev->bar_data[bar_num].length_bytes);
-	return ret;
 }
 
 /*
@@ -395,7 +381,6 @@ fail:
  */
 static void gasket_unmap_pci_bar(struct gasket_dev *dev, int bar_num)
 {
-	ulong base, bytes;
 	struct gasket_internal_desc *internal_desc = dev->internal_desc;
 	const struct gasket_driver_desc *driver_desc =
 		internal_desc->driver_desc;
@@ -407,18 +392,8 @@ static void gasket_unmap_pci_bar(struct gasket_dev *dev, int bar_num)
 	if (driver_desc->bar_descriptions[bar_num].type != PCI_BAR)
 		return;
 
-	iounmap(dev->bar_data[bar_num].virt_base);
+	/* The mapping itself is released by devres when the driver unbinds. */
 	dev->bar_data[bar_num].virt_base = NULL;
-
-	base = pci_resource_start(dev->pci_dev, bar_num);
-	if (!base) {
-		dev_err(dev->dev, "cannot get PCI BAR%u base address\n",
-			bar_num);
-		return;
-	}
-
-	bytes = pci_resource_len(dev->pci_dev, bar_num);
-	release_mem_region(base, bytes);
 }
 
 /*
@@ -434,6 +409,19 @@ static int gasket_setup_pci(struct pci_dev *pci_dev,
 {
 	int i, mapped_bars, ret;
 
+	if (dma_bit_mask < 32 || dma_bit_mask > 64) {
+		dev_err(&pci_dev->dev, "dma_bit_mask %d out of range 32..64\n",
+			dma_bit_mask);
+		return -EINVAL;
+	}
+	ret = dma_set_mask_and_coherent(&pci_dev->dev,
+					DMA_BIT_MASK(dma_bit_mask));
+	if (ret) {
+		dev_err(&pci_dev->dev, "cannot set %d-bit DMA mask [ret=%d]\n",
+			dma_bit_mask, ret);
+		return ret;
+	}
+
 	for (i = 0; i < GASKET_NUM_BARS; i++) {
 		ret = gasket_map_pci_bar(gasket_dev, i);
 		if (ret) {
@@ -448,7 +436,7 @@ fail:
 	for (i = 0; i < mapped_bars; i++)
 		gasket_unmap_pci_bar(gasket_dev, i);
 
-	return -ENOMEM;
+	return ret;
 }
 
 /* Unmaps memory for the specified device. */
@@ -1572,7 +1560,7 @@ static const struct file_operations gasket_file_ops = {
 	.open = gasket_open,
 	.release = gasket_release,
 	.unlocked_ioctl = gasket_ioctl,
-	.compat_ioctl = gasket_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 };
 
 /* Perform final init and marks the device as active. */

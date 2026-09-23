@@ -1091,12 +1091,13 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 	struct gasket_dev *gasket_dev;
 	struct apex_dev *apex_dev;
 
-	ret = pci_enable_device(pci_dev);
+	/* Managed: devres disables the device again when the driver unbinds. */
+	ret = pcim_enable_device(pci_dev);
 #ifdef MODULE
 	if (ret) {
 		apex_pci_fixup_class(pci_dev);
 		pci_bus_assign_resources(pci_dev->bus);
-		ret = pci_enable_device(pci_dev);
+		ret = pcim_enable_device(pci_dev);
 	}
 #endif
 	if (ret) {
@@ -1109,7 +1110,6 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 	ret = gasket_pci_add_device(pci_dev, &gasket_dev);
 	if (ret) {
 		dev_err(&pci_dev->dev, "error adding gasket device\n");
-		pci_disable_device(pci_dev);
 		return ret;
 	}
 
@@ -1172,7 +1172,6 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 remove_device:
 	pci_set_drvdata(pci_dev, NULL);
 	gasket_pci_remove_device(pci_dev);
-	pci_disable_device(pci_dev);
 	kfree(apex_dev);
 	return ret;
 }
@@ -1200,10 +1199,11 @@ static void apex_pci_remove(struct pci_dev *pci_dev)
 	kfree(apex_dev);
 remove_device:
 	gasket_pci_remove_device(pci_dev);
-	pci_disable_device(pci_dev);
 }
 
-static int apex_pci_suspend(struct pci_dev *pci_dev, pm_message_t state) {
+static int apex_pm_suspend(struct device *dev)
+{
+	struct pci_dev *pci_dev = to_pci_dev(dev);
 	struct apex_dev *apex_dev = pci_get_drvdata(pci_dev);
 	struct gasket_dev *gasket_dev;
 
@@ -1221,8 +1221,9 @@ static int apex_pci_suspend(struct pci_dev *pci_dev, pm_message_t state) {
 	return 0;
 }
 
-static int apex_pci_resume(struct pci_dev *pci_dev)
+static int apex_pm_resume(struct device *dev)
 {
+	struct pci_dev *pci_dev = to_pci_dev(dev);
 	struct apex_dev *apex_dev = pci_get_drvdata(pci_dev);
 	struct gasket_dev *gasket_dev;
 	int temp_poll_interval;
@@ -1248,6 +1249,50 @@ static int apex_pci_resume(struct pci_dev *pci_dev)
 				      msecs_to_jiffies(temp_poll_interval));
 	return 0;
 }
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apex_pm_ops, apex_pm_suspend, apex_pm_resume);
+
+/*
+ * Power-off / reboot / kexec: stop the temperature poller and DMA, and put the
+ * chip in reset, so it is quiet when power goes away (upstream issue #49).
+ */
+static void apex_pci_shutdown(struct pci_dev *pci_dev)
+{
+	struct apex_dev *apex_dev = pci_get_drvdata(pci_dev);
+	struct gasket_dev *gasket_dev;
+
+	if (!apex_dev)
+		return;
+	gasket_dev = apex_dev->gasket_dev_ptr;
+
+	cancel_delayed_work_sync(&apex_dev->check_temperature_work);
+	mutex_lock(&gasket_dev->mutex);
+	apex_enter_reset(gasket_dev);
+	mutex_unlock(&gasket_dev->mutex);
+	pci_clear_master(pci_dev);
+}
+
+/*
+ * PCIe error (AER/DPC). The driver cannot rebuild userspace's state on the
+ * chip after a reset, so it stops touching the device and reports it lost.
+ */
+static pci_ers_result_t apex_pci_error_detected(struct pci_dev *pci_dev,
+						pci_channel_state_t state)
+{
+	struct apex_dev *apex_dev = pci_get_drvdata(pci_dev);
+
+	dev_err(&pci_dev->dev, "PCIe error (state %d), device disabled\n",
+		state);
+	if (apex_dev) {
+		cancel_delayed_work_sync(&apex_dev->check_temperature_work);
+		apex_dev->gasket_dev_ptr->status = GASKET_STATUS_DEAD;
+	}
+	return PCI_ERS_RESULT_DISCONNECT;
+}
+
+static const struct pci_error_handlers apex_pci_err_handlers = {
+	.error_detected = apex_pci_error_detected,
+};
 
 static struct gasket_driver_desc apex_desc = {
 	.name = "apex",
@@ -1296,10 +1341,9 @@ static struct pci_driver apex_pci_driver = {
 	.name = "apex",
 	.probe = apex_pci_probe,
 	.remove = apex_pci_remove,
-#ifdef CONFIG_PM_SLEEP
-	.suspend = apex_pci_suspend,
-	.resume = apex_pci_resume,
-#endif
+	.shutdown = apex_pci_shutdown,
+	.err_handler = &apex_pci_err_handlers,
+	.driver.pm = pm_sleep_ptr(&apex_pm_ops),
 	.id_table = apex_pci_ids,
 };
 

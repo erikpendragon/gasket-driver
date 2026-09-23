@@ -17,7 +17,11 @@
 #define trace_gasket_interrupt_event(x, ...)
 #endif
 /* Retry attempts if the requested number of interrupts aren't available. */
-#define MSIX_RETRY_COUNT 3
+/* The dev_id of one MSI-X vector's handler. */
+struct gasket_msix_vector {
+	struct gasket_interrupt_data *interrupt_data;
+	int index;
+};
 
 /* Instance interrupt management data. */
 struct gasket_interrupt_data {
@@ -45,17 +49,11 @@ struct gasket_interrupt_data {
 	/* The width of a single interrupt in a packed interrupt register. */
 	int pack_width;
 
-	/*
-	 * Design-wise, these elements should be bundled together, but
-	 * pci_enable_msix's interface requires that they be managed
-	 * individually (requires array of struct msix_entry).
-	 */
-
 	/* The number of successfully configured interrupts. */
 	int num_configured;
 
-	/* The MSI-X data for each requested/configured interrupt. */
-	struct msix_entry *msix_entries;
+	/* Per-vector handler cookie: which interrupt a vector is. */
+	struct gasket_msix_vector *vectors;
 
 	/* The eventfd "callback" data for each interrupt. */
 	struct eventfd_ctx **eventfd_ctxs;
@@ -161,63 +159,48 @@ gasket_handle_interrupt(struct gasket_interrupt_data *interrupt_data,
 
 static irqreturn_t gasket_msix_interrupt_handler(int irq, void *dev_id)
 {
-	struct gasket_interrupt_data *interrupt_data = dev_id;
-	int interrupt = -1;
-	int i;
+	struct gasket_msix_vector *vector = dev_id;
 
-	/* If this linear lookup is a problem, we can maintain a map/hash. */
-	for (i = 0; i < interrupt_data->num_interrupts; i++) {
-		if (interrupt_data->msix_entries[i].vector == irq) {
-			interrupt = interrupt_data->msix_entries[i].entry;
-			break;
-		}
-	}
-	if (interrupt == -1) {
-		pr_err("Received unknown irq %d\n", irq);
-		return IRQ_HANDLED;
-	}
-	gasket_handle_interrupt(interrupt_data, interrupt);
+	gasket_handle_interrupt(vector->interrupt_data, vector->index);
 	return IRQ_HANDLED;
 }
 
+/*
+ * Allocate exactly num_interrupts MSI-X vectors and request each one.
+ * Registered eventfds are kept, so this can re-run after resume.
+ */
 static int
 gasket_interrupt_msix_init(struct gasket_interrupt_data *interrupt_data)
 {
-	int ret = 1;
+	int ret;
 	int i;
 
-	interrupt_data->msix_entries =
-		kcalloc(interrupt_data->num_interrupts,
-			sizeof(struct msix_entry), GFP_KERNEL);
-	if (!interrupt_data->msix_entries)
+	interrupt_data->vectors = kcalloc(interrupt_data->num_interrupts,
+					  sizeof(*interrupt_data->vectors),
+					  GFP_KERNEL);
+	if (!interrupt_data->vectors)
 		return -ENOMEM;
 
-	for (i = 0; i < interrupt_data->num_interrupts; i++) {
-		interrupt_data->msix_entries[i].entry = i;
-		interrupt_data->msix_entries[i].vector = 0;
-		interrupt_data->eventfd_ctxs[i] = NULL;
-	}
-
-	/* Retry MSIX_RETRY_COUNT times if not enough IRQs are available. */
-	for (i = 0; i < MSIX_RETRY_COUNT && ret > 0; i++)
-		ret = pci_enable_msix_exact(interrupt_data->pci_dev,
-					    interrupt_data->msix_entries,
-					    interrupt_data->num_interrupts);
-
-	if (ret)
-		return ret > 0 ? -EBUSY : ret;
+	ret = pci_alloc_irq_vectors(interrupt_data->pci_dev,
+				    interrupt_data->num_interrupts,
+				    interrupt_data->num_interrupts,
+				    PCI_IRQ_MSIX);
+	if (ret < 0)
+		return ret;
 	interrupt_data->msix_configured = 1;
 
 	for (i = 0; i < interrupt_data->num_interrupts; i++) {
-		ret = request_irq(interrupt_data->msix_entries[i].vector,
-				  gasket_msix_interrupt_handler, 0,
-				  interrupt_data->name, interrupt_data);
+		int irq = pci_irq_vector(interrupt_data->pci_dev, i);
 
+		interrupt_data->vectors[i].interrupt_data = interrupt_data;
+		interrupt_data->vectors[i].index = i;
+		ret = request_irq(irq, gasket_msix_interrupt_handler, 0,
+				  interrupt_data->name,
+				  &interrupt_data->vectors[i]);
 		if (ret) {
 			dev_err(&interrupt_data->pci_dev->dev,
-				"Cannot get IRQ for interrupt %d, vector %d; "
-				"%d\n",
-				i, interrupt_data->msix_entries[i].vector, ret);
+				"Cannot get IRQ for interrupt %d, vector %d; %d\n",
+				i, irq, ret);
 			return ret;
 		}
 
@@ -354,18 +337,16 @@ void gasket_interrupt_msix_cleanup(struct gasket_interrupt_data *interrupt_data)
 {
 	int i;
 
-	for (i = 0; i < interrupt_data->num_configured; i++) {
-		gasket_interrupt_clear_eventfd(interrupt_data, i);
-		free_irq(interrupt_data->msix_entries[i].vector,
-			 interrupt_data);
-	}
+	for (i = 0; i < interrupt_data->num_configured; i++)
+		free_irq(pci_irq_vector(interrupt_data->pci_dev, i),
+			 &interrupt_data->vectors[i]);
 	interrupt_data->num_configured = 0;
 
 	if (interrupt_data->msix_configured)
-		pci_disable_msix(interrupt_data->pci_dev);
+		pci_free_irq_vectors(interrupt_data->pci_dev);
 	interrupt_data->msix_configured = 0;
-	kfree(interrupt_data->msix_entries);
-	interrupt_data->msix_entries = NULL;
+	kfree(interrupt_data->vectors);
+	interrupt_data->vectors = NULL;
 }
 EXPORT_SYMBOL(gasket_interrupt_msix_cleanup);
 
@@ -426,6 +407,8 @@ void gasket_interrupt_cleanup(struct gasket_dev *gasket_dev)
 {
 	struct gasket_interrupt_data *interrupt_data =
 		gasket_dev->interrupt_data;
+	int i;
+
 	/*
 	 * It is possible to get an error code from gasket_interrupt_init
 	 * before interrupt_data has been allocated, so check it.
@@ -449,6 +432,10 @@ void gasket_interrupt_cleanup(struct gasket_dev *gasket_dev)
 	default:
 		break;
 	}
+
+	/* Drop every eventfd reference, configured vector or not. */
+	for (i = 0; i < interrupt_data->num_interrupts; i++)
+		gasket_interrupt_clear_eventfd(interrupt_data, i);
 
 	kfree(interrupt_data->interrupt_counts);
 	kfree(interrupt_data->eventfd_ctxs);
