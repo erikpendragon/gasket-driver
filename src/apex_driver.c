@@ -810,9 +810,10 @@ static ssize_t sysfs_store(struct device *device, struct device_attribute *attr,
 		break;
 	}
 
-	if (!gasket_dev || !gasket_dev->pci_dev ||
-	    !(apex_dev = pci_get_drvdata(gasket_dev->pci_dev)) ||
-	    !gasket_dev->bar_data[APEX_BAR_INDEX].virt_base)
+	if (!gasket_dev || !gasket_dev->pci_dev)
+		return -ENODEV;
+	apex_dev = pci_get_drvdata(gasket_dev->pci_dev);
+	if (!apex_dev || !gasket_dev->bar_data[APEX_BAR_INDEX].virt_base)
 		return -ENODEV;
 
 	switch (gasket_attr_type(attr)) {
