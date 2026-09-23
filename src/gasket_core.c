@@ -10,6 +10,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "gasket_core.h"
+#include "gasket_compat.h"
 
 #include "gasket_interrupt.h"
 #include "gasket_ioctl.h"
@@ -27,7 +28,7 @@
 #include <linux/platform_device.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
-#include <linux/version.h>
+
 
 #ifdef GASKET_KERNEL_TRACE_SUPPORT
 #define CREATE_TRACE_POINTS
@@ -920,9 +921,9 @@ int gasket_mm_unmap_region(const struct gasket_dev *gasket_dev,
 	 *
 	 * Next multiple of y: ceil_div(x, y) * y
 	 */
-	zap_vma_ptes(vma, vma->vm_start + virt_offset,
-		     DIV_ROUND_UP(mappable_region.length_bytes, PAGE_SIZE) *
-		     PAGE_SIZE);
+	gasket_zap_vma_range(vma, vma->vm_start + virt_offset,
+			     DIV_ROUND_UP(mappable_region.length_bytes,
+					  PAGE_SIZE) * PAGE_SIZE);
 	return 0;
 }
 EXPORT_SYMBOL(gasket_mm_unmap_region);
@@ -1049,7 +1050,7 @@ static int gasket_mmap(struct file *filp, struct vm_area_struct *vma)
 	int bar_index;
 	int has_mapped_anything = 0;
 	ulong permissions;
-	ulong raw_offset, vma_size;
+	ulong raw_offset;
 	bool is_coherent_region;
 	const struct gasket_driver_desc *driver_desc;
 	struct gasket_dev *gasket_dev = (struct gasket_dev *)filp->private_data;
@@ -1071,9 +1072,8 @@ static int gasket_mmap(struct file *filp, struct vm_area_struct *vma)
 	/* Calculate the offset of this range into physical mem. */
 	raw_offset = (vma->vm_pgoff << PAGE_SHIFT) +
 		driver_desc->legacy_mmap_address_offset;
-	vma_size = vma->vm_end - vma->vm_start;
 	trace_gasket_mmap_entry(gasket_dev->dev_info.name, raw_offset,
-				vma_size);
+				vma->vm_end - vma->vm_start);
 
 	/*
 	 * Check if the raw offset is within a bar region. If not, check if it
@@ -1838,14 +1838,7 @@ int gasket_register_device(const struct gasket_driver_desc *driver_desc)
 	mutex_init(&internal->mutex);
 	memset(internal->devs, 0, sizeof(struct gasket_dev *) * GASKET_DEV_MAX);
 
-    /* Function signature for `class_create()` is changed in kernel >= 6.4.x
-     * to only accept a single argument.
-     * */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
-    internal->class = class_create(driver_desc->module, driver_desc->name);
-#else
-    internal->class = class_create(driver_desc->name);
-#endif
+	internal->class = class_create(driver_desc->name);
 
 	if (IS_ERR(internal->class)) {
 		pr_err("Cannot register %s class [ret=%ld]\n",
@@ -1928,8 +1921,19 @@ static int __init gasket_init(void)
 	return 0;
 }
 
+/*
+ * Nothing to tear down: gasket_init() only initialises static state, and
+ * every driver that registered with the framework holds a module reference
+ * on gasket until it unregisters. Without an exit hook the module could
+ * never be unloaded.
+ */
+static void __exit gasket_exit(void)
+{
+}
+
 MODULE_DESCRIPTION("Google Gasket driver framework");
 MODULE_VERSION(GASKET_FRAMEWORK_VERSION);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Rob Springer <rspringer@google.com>");
 module_init(gasket_init);
+module_exit(gasket_exit);

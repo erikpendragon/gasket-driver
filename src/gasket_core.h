@@ -224,8 +224,8 @@ struct gasket_coherent_buffer_desc {
 
 /* Coherent buffer structure. */
 struct gasket_coherent_buffer {
-	/* Virtual base address. */
-	u8 __iomem *virt_base;
+	/* Virtual base address (normal kernel memory, not MMIO). */
+	u8 *virt_base;
 
 	/* Physical base address. */
 	dma_addr_t phys_base;

@@ -53,13 +53,9 @@
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 
-#if __has_include(<linux/dma-buf.h>)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-MODULE_IMPORT_NS("DMA_BUF");
-#else
-MODULE_IMPORT_NS(DMA_BUF);
-#endif
-#endif
+#include "gasket_compat.h"
+
+GASKET_IMPORT_NS_DMA_BUF();
 
 #include "gasket_constants.h"
 #include "gasket_core.h"
@@ -541,12 +537,8 @@ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
 				return -EINVAL;
 
 			/* Page already mapped for DMA. */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0)
-			ptes[i].dma_addr = sg_page_iter_dma_address(sg_iter);
-#else
 			ptes[i].dma_addr = sg_page_iter_dma_address(
 				container_of(sg_iter, struct sg_dma_page_iter, base));
-#endif
 			ptes[i].page = NULL;
 			offset = 0;
 		} else if (is_coherent(pg_tbl, host_addr)) {
