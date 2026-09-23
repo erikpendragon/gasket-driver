@@ -422,6 +422,9 @@ void gasket_page_table_cleanup(struct gasket_page_table *pg_tbl)
 	vfree(pg_tbl->entries);
 	pg_tbl->entries = NULL;
 
+	/* The coherent buffer itself belongs to the device, not the table. */
+	kfree(pg_tbl->coherent_pages);
+
 	put_device(pg_tbl->device);
 	kfree(pg_tbl);
 }
@@ -1665,6 +1668,21 @@ int gasket_free_coherent_memory(struct gasket_dev *gasket_dev, u64 size,
 	return 0;
 }
 
+/* Free the device's coherent DMA buffer, if any. Idempotent. */
+void gasket_free_coherent_buffer(struct gasket_dev *gasket_dev)
+{
+	if (!gasket_dev->coherent_buffer.length_bytes)
+		return;
+
+	dma_free_coherent(gasket_get_device(gasket_dev),
+			  gasket_dev->coherent_buffer.length_bytes,
+			  gasket_dev->coherent_buffer.virt_base,
+			  gasket_dev->coherent_buffer.phys_base);
+	gasket_dev->coherent_buffer.length_bytes = 0;
+	gasket_dev->coherent_buffer.virt_base = NULL;
+	gasket_dev->coherent_buffer.phys_base = 0;
+}
+
 /* Release all coherent memory. */
 void gasket_free_coherent_memory_all(
 	struct gasket_dev *gasket_dev, u64 index)
@@ -1672,15 +1690,7 @@ void gasket_free_coherent_memory_all(
 	if (!gasket_dev->page_table[index])
 		return;
 
-	if (gasket_dev->coherent_buffer.length_bytes) {
-		dma_free_coherent(gasket_get_device(gasket_dev),
-				  gasket_dev->coherent_buffer.length_bytes,
-				  gasket_dev->coherent_buffer.virt_base,
-				  gasket_dev->coherent_buffer.phys_base);
-		gasket_dev->coherent_buffer.length_bytes = 0;
-		gasket_dev->coherent_buffer.virt_base = NULL;
-		gasket_dev->coherent_buffer.phys_base = 0;
-	}
+	gasket_free_coherent_buffer(gasket_dev);
 
 	mutex_lock(&gasket_dev->page_table[index]->mutex);
 	kfree(gasket_dev->page_table[index]->coherent_pages);

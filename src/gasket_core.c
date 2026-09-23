@@ -169,19 +169,19 @@ static int gasket_owned_by_current_tgid(struct gasket_cdev_info *info)
  *
  * Returns the located slot number on success or a negative number on failure.
  */
+/* Called with internal_desc->mutex held; the caller publishes the slot. */
 static int gasket_find_dev_slot(struct gasket_internal_desc *internal_desc,
 				const char *kobj_name)
 {
 	int i;
 
-	mutex_lock(&internal_desc->mutex);
+	lockdep_assert_held(&internal_desc->mutex);
 
 	/* Search for a previous instance of this device. */
 	for (i = 0; i < GASKET_DEV_MAX; i++) {
 		if (internal_desc->devs[i] &&
 		    strcmp(internal_desc->devs[i]->kobj_name, kobj_name) == 0) {
 			pr_err("Duplicate device %s\n", kobj_name);
-			mutex_unlock(&internal_desc->mutex);
 			return -EBUSY;
 		}
 	}
@@ -194,11 +194,9 @@ static int gasket_find_dev_slot(struct gasket_internal_desc *internal_desc,
 
 	if (i == GASKET_DEV_MAX) {
 		pr_err("Too many registered devices; max %d\n", GASKET_DEV_MAX);
-		mutex_unlock(&internal_desc->mutex);
 		return -EBUSY;
 	}
 
-	mutex_unlock(&internal_desc->mutex);
 	return i;
 }
 
@@ -222,14 +220,26 @@ static int gasket_alloc_dev(struct gasket_internal_desc *internal_desc,
 
 	*pdev = NULL;
 
-	dev_idx = gasket_find_dev_slot(internal_desc, parent_name);
-	if (dev_idx < 0)
-		return dev_idx;
-
 	gasket_dev = kzalloc(sizeof(*gasket_dev), GFP_KERNEL);
 	if (!gasket_dev) {
 		pr_err("no memory for device, parent %s\n", parent_name);
 		return -ENOMEM;
+	}
+
+	/*
+	 * Pick and claim the slot in one lock hold, so two parallel probes
+	 * cannot get the same index. Lookups by pci_dev skip this entry until
+	 * gasket_pci_add_device() sets pci_dev.
+	 */
+	snprintf(gasket_dev->kobj_name, GASKET_NAME_MAX, "%s", parent_name);
+	mutex_lock(&internal_desc->mutex);
+	dev_idx = gasket_find_dev_slot(internal_desc, parent_name);
+	if (dev_idx >= 0)
+		internal_desc->devs[dev_idx] = gasket_dev;
+	mutex_unlock(&internal_desc->mutex);
+	if (dev_idx < 0) {
+		kfree(gasket_dev);
+		return dev_idx;
 	}
 
 	mutex_init(&gasket_dev->mutex);
@@ -238,7 +248,6 @@ static int gasket_alloc_dev(struct gasket_internal_desc *internal_desc,
 
 	gasket_dev->internal_desc = internal_desc;
 	gasket_dev->dev_idx = dev_idx;
-	snprintf(gasket_dev->kobj_name, GASKET_NAME_MAX, "%s", parent_name);
 	gasket_dev->dev = get_device(parent);
 	gasket_dev->dma_dev = get_device(parent);
 	/* gasket_bar_data is uninitialized. */
@@ -269,14 +278,13 @@ static int gasket_alloc_dev(struct gasket_internal_desc *internal_desc,
 	if (ret) {
 		dev_err(parent, "cannot create %s device %s [ret = %d]\n",
 			driver_desc->name, dev_info->name, ret);
+		mutex_lock(&internal_desc->mutex);
+		internal_desc->devs[dev_idx] = NULL;
+		mutex_unlock(&internal_desc->mutex);
 		put_device(&gasket_dev->class_dev);
 		return ret;
 	}
 	dev_info->device = &gasket_dev->class_dev;
-
-	mutex_lock(&internal_desc->mutex);
-	internal_desc->devs[dev_idx] = gasket_dev;
-	mutex_unlock(&internal_desc->mutex);
 	*pdev = gasket_dev;
 
 	/* cdev has not yet been added; cdev_added is 0 */
@@ -692,9 +700,35 @@ void gasket_disable_device(struct gasket_dev *gasket_dev)
 		unmap_mapping_range(of->filp->f_mapping, 0, 0, 1);
 	mutex_unlock(&gasket_dev->mutex);
 
+	/*
+	 * Stop the chip before the memory it may be using goes away: reset it
+	 * (stops the cores and pauses DMA) if it still answers, then turn off
+	 * bus mastering so no DMA can reach host memory at all.
+	 */
+	if (gasket_dev->pci_dev) {
+		if (driver_desc->device_reset_cb &&
+		    pci_device_is_present(gasket_dev->pci_dev)) {
+			mutex_lock(&gasket_dev->mutex);
+			driver_desc->device_reset_cb(gasket_dev);
+			mutex_unlock(&gasket_dev->mutex);
+		}
+		pci_clear_master(gasket_dev->pci_dev);
+	}
+
 	gasket_dev->status = GASKET_STATUS_DEAD;
 
 	gasket_interrupt_cleanup(gasket_dev);
+
+	/*
+	 * A VMA that still maps the coherent buffer (possibly one mmap() was
+	 * linking during the unmap walk above) keeps it until it is closed.
+	 */
+	mutex_lock(&gasket_dev->mutex);
+	if (gasket_dev->coherent_mmap_count)
+		gasket_dev->coherent_free_pending = true;
+	else
+		gasket_free_coherent_buffer(gasket_dev);
+	mutex_unlock(&gasket_dev->mutex);
 
 	for (i = 0; i < driver_desc->num_page_tables; ++i) {
 		if (gasket_dev->page_table[i]) {
@@ -702,14 +736,7 @@ void gasket_disable_device(struct gasket_dev *gasket_dev)
 
 			gasket_page_table_reset(gasket_dev->page_table[i]);
 
-			/*
-			 * User mappings were zapped above; any VMA still
-			 * holding the buffer only sees SIGBUS now. A later
-			 * close() finds nothing left to free.
-			 */
 			mutex_lock(&gasket_dev->mutex);
-			gasket_free_coherent_memory_all(gasket_dev, i);
-			gasket_dev->coherent_free_pending = false;
 			pg_tbl = gasket_dev->page_table[i];
 			gasket_dev->page_table[i] = NULL;
 			mutex_unlock(&gasket_dev->mutex);
@@ -1081,6 +1108,8 @@ static void gasket_coherent_vma_close(struct vm_area_struct *vma)
 		gasket_dev->coherent_free_pending = false;
 		for (i = 0; i < gasket_dev->num_page_tables; ++i)
 			gasket_free_coherent_memory_all(gasket_dev, i);
+		/* After removal the page tables are gone; free the buffer. */
+		gasket_free_coherent_buffer(gasket_dev);
 	}
 	mutex_unlock(&gasket_dev->mutex);
 }
@@ -1137,6 +1166,57 @@ static int gasket_mmap_coherent(struct gasket_dev *gasket_dev,
 	gasket_dev->coherent_mmap_count++;
 	return 0;
 }
+
+/*
+ * Page fault on a BAR mapping: insert the one page, if it lies in a mappable
+ * region and the device is still present. Runs under mmap_lock; takes the
+ * device mutex, which removal holds while it zaps user mappings after
+ * setting "gone", so no page can be inserted after the zap.
+ */
+static vm_fault_t gasket_bar_vma_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct gasket_dev *gasket_dev = vma->vm_private_data;
+	const struct gasket_driver_desc *driver_desc =
+		gasket_dev->internal_desc->driver_desc;
+	const struct gasket_bar_desc *bar_desc;
+	ulong raw_offset, bar_offset, start, end;
+	vm_fault_t ret = VM_FAULT_SIGBUS;
+	int bar_index, i;
+
+	raw_offset = (vmf->pgoff << PAGE_SHIFT) +
+		     driver_desc->legacy_mmap_address_offset;
+
+	mutex_lock(&gasket_dev->mutex);
+	if (READ_ONCE(gasket_dev->gone))
+		goto out;
+
+	bar_index = gasket_get_bar_index(gasket_dev, raw_offset);
+	if (bar_index < 0)
+		goto out;
+	bar_desc = &driver_desc->bar_descriptions[bar_index];
+	bar_offset = raw_offset - bar_desc->base;
+
+	for (i = 0; i < bar_desc->num_mappable_regions; i++) {
+		start = bar_desc->mappable_regions[i].start;
+		end = start + bar_desc->mappable_regions[i].length_bytes;
+		if (bar_offset >= start && bar_offset < end)
+			break;
+	}
+	if (i == bar_desc->num_mappable_regions)
+		goto out;
+
+	ret = vmf_insert_pfn(vma, vmf->address,
+			     (gasket_dev->bar_data[bar_index].phys_base +
+			      bar_offset) >> PAGE_SHIFT);
+out:
+	mutex_unlock(&gasket_dev->mutex);
+	return ret;
+}
+
+static const struct vm_operations_struct gasket_bar_vm_ops = {
+	.fault = gasket_bar_vma_fault,
+};
 
 /* Map a device's BARs into user space. Called with gasket_dev->mutex held. */
 static int __gasket_mmap(struct file *filp, struct vm_area_struct *vma)
@@ -1244,6 +1324,41 @@ static int __gasket_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	/* Marks the VMA's pages as uncacheable. */
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+	/*
+	 * Static regions: map on first touch (see gasket_bar_vma_fault()), so
+	 * removal can reliably take every page away again.
+	 */
+	if (!driver_desc->get_mappable_regions_cb) {
+		ulong bar_offset, virt_offset;
+		struct gasket_mappable_region unused;
+
+		ret = gasket_mm_vma_bar_offset(gasket_dev, vma, &bar_offset);
+		if (ret) {
+			kfree(map_regions);
+			return ret;
+		}
+		for (i = 0; i < num_map_regions; i++)
+			if (gasket_mm_get_mapping_addrs(&map_regions[i],
+							bar_offset,
+							vma->vm_end -
+							vma->vm_start,
+							&unused, &virt_offset))
+				has_mapped_anything = 1;
+		kfree(map_regions);
+		if (!has_mapped_anything) {
+			dev_err(gasket_dev->dev,
+				"Map request did not contain a valid region.\n");
+			trace_gasket_mmap_exit(-EINVAL);
+			return -EINVAL;
+		}
+		vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND |
+				  VM_DONTDUMP);
+		vma->vm_ops = &gasket_bar_vm_ops;
+		trace_gasket_mmap_exit(0);
+		return 0;
+	}
+
 	for (i = 0; i < num_map_regions; i++) {
 		map_status = do_map_region(gasket_dev, vma, &map_regions[i]);
 		/* Try the next region if this one was not mappable. */
@@ -1416,8 +1531,9 @@ static int gasket_release(struct inode *inode, struct file *file)
 
 	/*
 	 * Keep removal out while the hardware is torn down below. After
-	 * removal only the bookkeeping is done: removal already reset the
-	 * chip and released every mapping.
+	 * removal only the bookkeeping is done: removal already reset the chip
+	 * (if it still answered), turned off bus mastering and released every
+	 * page table mapping.
 	 */
 	down_read(&gasket_dev->state_sem);
 	present = !gasket_dev->gone;
@@ -1534,10 +1650,13 @@ static long gasket_ioctl(struct file *filp, uint cmd, ulong arg)
  *
  * This runs with the caller's mmap_lock held, so it must not wait on
  * state_sem (an ioctl holding state_sem may be waiting for that same
- * mmap_lock while removal waits to take state_sem for writing). Removal
- * sets "gone" first and then unmaps every user mapping under the device
- * mutex, so checking "gone" under the mutex here is enough: a mapping made
- * before removal is unmapped by it, and none is made after.
+ * mmap_lock while removal waits to take state_sem for writing).
+ *
+ * The VMA is linked into the file's mapping only after this returns, so
+ * removal's unmap walk can miss a VMA created at that moment. That is safe:
+ * BAR pages are only inserted by the fault handler, which re-checks "gone"
+ * under the mutex; and the coherent buffer is counted here before the VMA
+ * is linked, so removal defers freeing it until that VMA is closed.
  */
 static int gasket_mmap(struct file *filp, struct vm_area_struct *vma)
 {
@@ -1755,6 +1874,9 @@ void gasket_pci_remove_device(struct pci_dev *pci_dev)
 	dev_dbg(gasket_dev->dev, "remove %s PCI gasket device\n",
 		internal_desc->driver_desc->name);
 
+	/* sysfs first (waits for readers), then the BARs they may touch. */
+	if (device_is_registered(&gasket_dev->class_dev))
+		device_del(&gasket_dev->class_dev);
 	gasket_cleanup_pci(gasket_dev);
 	__gasket_remove_device(internal_desc, gasket_dev);
 }

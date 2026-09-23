@@ -265,6 +265,9 @@ int gasket_free_coherent_memory(struct gasket_dev *gasket_dev, uint64_t size,
 void gasket_free_coherent_memory_all(struct gasket_dev *gasket_dev,
 				     uint64_t index);
 
+/* Free the device's coherent DMA buffer, if allocated. */
+void gasket_free_coherent_buffer(struct gasket_dev *gasket_dev);
+
 /*
  * Records the host_addr to coherent dma memory mapping.
  * @gasket_dev: Gasket Device.

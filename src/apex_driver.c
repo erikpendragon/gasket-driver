@@ -1172,6 +1172,9 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 remove_device:
 	pci_set_drvdata(pci_dev, NULL);
 	gasket_pci_remove_device(pci_dev);
+	/* sysfs is gone now, so nothing can re-arm the poller. */
+	if (apex_dev)
+		cancel_delayed_work_sync(&apex_dev->check_temperature_work);
 	kfree(apex_dev);
 	return ret;
 }
