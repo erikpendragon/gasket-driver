@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+	configure)
+		# The udev rule hands /dev/apex_* to group apex. Create the
+		# group if it is missing, or the rule silently leaves the node
+		# owned by root.
+		if ! getent group apex >/dev/null; then
+			groupadd --system apex
+		fi
+		# Apply the group to a device node that already exists.
+		if [ -d /run/udev ] && command -v udevadm >/dev/null; then
+			udevadm trigger --subsystem-match=apex || true
+		fi
+	;;
+esac
+
+#DEBHELPER#
+
+exit 0
