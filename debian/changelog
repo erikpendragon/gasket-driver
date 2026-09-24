@@ -1,3 +1,16 @@
+gasket-dkms (1.0-19~modern1) unstable; urgency=medium
+
+  * Modernized driver (fork of feranick/gasket-driver).
+    - Builds on Linux 6.12 to 7.3; the modules can be unloaded.
+    - Safe device removal while in use; fault-based user mappings;
+      locking and page-table fixes.
+    - pin_user_pages, dma-buf, PCI/IRQ/PM plumbing on current kernel APIs;
+      .shutdown and PCIe error handlers; hwmon temperature sensor.
+    - Userspace ABI (gasket.h, apex.h, sysfs names, char major 120)
+      unchanged.
+
+ -- erikpendragon <7390273+erikpendragon@users.noreply.github.com>  Thu, 24 Sep 2026 12:00:00 -0400
+
 gasket-dkms (1.0-18.4) noble; urgency=medium
  
   * Update ffor Kernel 6.13+
